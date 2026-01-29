@@ -11,5 +11,6 @@
 
 insn *parse_line(char *buffer, insn *result, const int bits);
 void cleanup_insn(insn *instruction);
+bool parse_check_is_label(const char *buffer);
 
 #endif

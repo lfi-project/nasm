@@ -54,6 +54,15 @@ static bool set_prevlabel(const char *l)
     return l[0] != '.';
 }
 
+/*
+ * Return true if this is a local (dot-prefixed) label.
+ * Used by LFI for label alignment decisions.
+ */
+bool is_local_label(const char *label)
+{
+    return (label[0] == '.' && label[1] != '.');
+}
+
 #define LABEL_BLOCK     128     /* no. of labels/block */
 #define LBLK_SIZE       (LABEL_BLOCK * sizeof(union label))
 

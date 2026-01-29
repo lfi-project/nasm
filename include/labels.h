@@ -39,4 +39,6 @@ const char *local_scope(const char *label);
 
 extern uint64_t global_offset_changed;
 
+bool is_local_label(const char *label);
+
 #endif /* LABELS_H */

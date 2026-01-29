@@ -1450,3 +1450,36 @@ void cleanup_insn(insn * i)
 {
     free_eops(i->eops);
 }
+
+/*
+ * Check if a line defines a label (identifier followed by a colon).
+ * Used by LFI for label alignment.
+ *
+ * We only detect "label:" syntax (with colon), not bare labels,
+ * to avoid confusing single-word instructions (nop, ret, etc.) with labels.
+ */
+bool parse_check_is_label(const char *buffer)
+{
+    const char *p = buffer;
+
+    /* Skip leading whitespace */
+    while (*p && nasm_isspace(*p))
+        p++;
+
+    if (!*p || *p == ';' || *p == '[')
+        return false;
+
+    /* Check for identifier */
+    if (!nasm_isidstart(*p))
+        return false;
+
+    p++;
+    while (nasm_isidchar(*p))
+        p++;
+
+    /* Must be followed by colon to be a label */
+    if (*p == ':')
+        return true;
+
+    return false;
+}

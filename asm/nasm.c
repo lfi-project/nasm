@@ -90,6 +90,11 @@ struct location location;
 bool in_absolute;                 /* Flag we are in ABSOLUTE seg */
 struct location absolute;         /* Segment/offset inside ABSOLUTE */
 
+bool lfi_mode = false;
+bool lfi_no_loads = false;
+bool lfi_no_stores = false;
+bool lfi_no_segue = false;
+
 static struct RAA *offsets;
 
 static struct SAA *forwrefs;    /* keep track of forward references */
@@ -886,7 +891,11 @@ enum text_options {
     OPT_DEBUG,
     OPT_INFO,
     OPT_REPRODUCIBLE,
-    OPT_BITS
+    OPT_BITS,
+    OPT_LFI,
+    OPT_NO_LFI_LOADS,
+    OPT_NO_LFI_STORES,
+    OPT_NO_LFI_SEGUE
 };
 enum need_arg {
     ARG_NO,
@@ -925,6 +934,10 @@ static const struct textargs textopts[] = {
     {"debug",    OPT_DEBUG, ARG_MAYBE, 0},
     {"reproducible", OPT_REPRODUCIBLE, ARG_NO, 0},
     {"bits",     OPT_BITS, ARG_YES, 0},
+    {"lfi",      OPT_LFI, ARG_NO, 0},
+    {"no-lfi-loads",  OPT_NO_LFI_LOADS, ARG_NO, 0},
+    {"no-lfi-stores", OPT_NO_LFI_STORES, ARG_NO, 0},
+    {"no-lfi-segue",  OPT_NO_LFI_SEGUE, ARG_NO, 0},
     {NULL, OPT_BOGUS, ARG_NO, 0}
 };
 
@@ -1305,6 +1318,19 @@ static bool process_arg(char *p, char *q, int pass)
                 case OPT_REPRODUCIBLE:
                     reproducible = true;
                     break;
+                case OPT_LFI:
+                    lfi_mode = true;
+                    cmd_sb = 64;
+                    break;
+                case OPT_NO_LFI_LOADS:
+                    lfi_no_loads = true;
+                    break;
+                case OPT_NO_LFI_STORES:
+                    lfi_no_stores = true;
+                    break;
+                case OPT_NO_LFI_SEGUE:
+                    lfi_no_segue = true;
+                    break;
                 case OPT_HELP:
                     /* Allow --help topic without *requiring* topic */
                     if (!param)
@@ -1564,12 +1590,1226 @@ void print_final_report(bool failure)
     }
 }
 
+/*
+ * =====================================================================
+ * LFI (Lightweight Fault Isolation) support
+ *
+ * All LFI logic sits between parse_line() and process_insn() in
+ * assemble_file(). The approach:
+ *   1. Parse the original instruction via parse_line() -> insn struct
+ *   2. LFI layer inspects the insn, generates 1-N replacement
+ *      instructions (as text strings re-parsed via parse_line()),
+ *      computes NOP padding for 32-byte bundle alignment
+ *   3. Feed each replacement instruction (with padding) to process_insn()
+ * =====================================================================
+ */
+
+#define LFI_BUNDLE_SIZE  32
+#define LFI_MAX_REPLACE  16
+
+#define isOpOfType(op, ty) (((op).type & (ty)) == (ty))
+
+struct lfi_replacement {
+    insn instructions[LFI_MAX_REPLACE];
+    bool bundle_locked[LFI_MAX_REPLACE]; /* must be in same bundle */
+    int  count;
+    bool align_to_end; /* for calls: last insn ends at bundle boundary */
+};
+
+/*
+ * Map a 64-bit register enum to its 32-bit counterpart name string.
+ */
+static const char *lfi_reg32_name(enum reg_enum reg)
+{
+    switch (reg) {
+    case R_RAX: return "eax";
+    case R_RBX: return "ebx";
+    case R_RCX: return "ecx";
+    case R_RDX: return "edx";
+    case R_RSI: return "esi";
+    case R_RDI: return "edi";
+    case R_RBP: return "ebp";
+    case R_RSP: return "esp";
+    case R_R8:  return "r8d";
+    case R_R9:  return "r9d";
+    case R_R10: return "r10d";
+    case R_R11: return "r11d";
+    case R_R12: return "r12d";
+    case R_R13: return "r13d";
+    case R_R14: return "r14d";
+    case R_R15: return "r15d";
+    default:    return NULL;
+    }
+}
+
+/*
+ * Map a 64-bit register enum to its 64-bit name string.
+ */
+static const char *lfi_reg64_name(enum reg_enum reg)
+{
+    switch (reg) {
+    case R_RAX: case R_EAX: return "rax";
+    case R_RBX: case R_EBX: return "rbx";
+    case R_RCX: case R_ECX: return "rcx";
+    case R_RDX: case R_EDX: return "rdx";
+    case R_RSI: case R_ESI: return "rsi";
+    case R_RDI: case R_EDI: return "rdi";
+    case R_RBP: case R_EBP: return "rbp";
+    case R_RSP: case R_ESP: return "rsp";
+    case R_R8:  case R_R8D: return "r8";
+    case R_R9:  case R_R9D: return "r9";
+    case R_R10: case R_R10D: return "r10";
+    case R_R11: case R_R11D: return "r11";
+    case R_R12: case R_R12D: return "r12";
+    case R_R13: case R_R13D: return "r13";
+    case R_R14: case R_R14D: return "r14";
+    case R_R15: case R_R15D: return "r15";
+    default:    return NULL;
+    }
+}
+
+/*
+ * Map a register enum to its 64-bit equivalent enum.
+ */
+static enum reg_enum lfi_to_reg64(enum reg_enum reg)
+{
+    switch (reg) {
+    case R_EAX: case R_RAX: return R_RAX;
+    case R_EBX: case R_RBX: return R_RBX;
+    case R_ECX: case R_RCX: return R_RCX;
+    case R_EDX: case R_RDX: return R_RDX;
+    case R_ESI: case R_RSI: return R_RSI;
+    case R_EDI: case R_RDI: return R_RDI;
+    case R_EBP: case R_RBP: return R_RBP;
+    case R_ESP: case R_RSP: return R_RSP;
+    case R_R8D: case R_R8:  return R_R8;
+    case R_R9D: case R_R9:  return R_R9;
+    case R_R10D: case R_R10: return R_R10;
+    case R_R11D: case R_R11: return R_R11;
+    case R_R12D: case R_R12: return R_R12;
+    case R_R13D: case R_R13: return R_R13;
+    case R_R14D: case R_R14: return R_R14;
+    case R_R15D: case R_R15: return R_R15;
+    default: return reg;
+    }
+}
+
+/*
+ * Check if a memory operand is "safe" and needs no sandboxing.
+ */
+static bool lfi_is_safe_mem(const operand *op)
+{
+    enum reg_enum base = lfi_to_reg64(op->basereg);
+    enum reg_enum idx  = op->indexreg;
+
+    /* RIP-relative */
+    if (op->eaflags & EAF_REL)
+        return true;
+
+    /* RSP-based with no index */
+    if (base == R_RSP && idx == R_none)
+        return true;
+
+    /* RBP-based with no index */
+    if (base == R_RBP && idx == R_none)
+        return true;
+
+    /* R14-based with no index */
+    if (base == R_R14 && idx == R_none)
+        return true;
+
+    return false;
+}
+
+/*
+ * Build a memory operand string representation for re-parsing.
+ */
+static void lfi_mem_string(char *buf, size_t bufsz,
+                           enum reg_enum base, enum reg_enum index,
+                           int scale, int64_t offset)
+{
+    char base_str[32] = "";
+    char index_str[64] = "";
+    char offset_str[32] = "";
+
+    if (base != R_none) {
+        const char *n = nasm_reg_names[base - EXPR_REG_START];
+        snprintf(base_str, sizeof base_str, "%s", n);
+    }
+
+    if (index != R_none) {
+        const char *n = nasm_reg_names[index - EXPR_REG_START];
+        if (scale > 1)
+            snprintf(index_str, sizeof index_str, "%s%s*%d",
+                     base != R_none ? " + " : "", n, scale);
+        else
+            snprintf(index_str, sizeof index_str, "%s%s",
+                     base != R_none ? " + " : "", n);
+    }
+
+    if (offset != 0) {
+        if (offset > 0)
+            snprintf(offset_str, sizeof offset_str, " + %"PRId64, offset);
+        else
+            snprintf(offset_str, sizeof offset_str, " - %"PRId64, -offset);
+    }
+
+    snprintf(buf, bufsz, "[%s%s%s]", base_str, index_str, offset_str);
+}
+
+/*
+ * Generate operand size prefix string for a memory operand.
+ */
+static const char *lfi_size_prefix(const operand *op)
+{
+    unsigned int opsize = ((op->type & SIZE_MASK) >> SIZE_SHIFT) * 8;
+    switch (opsize) {
+    case 8:   return "byte ";
+    case 16:  return "word ";
+    case 32:  return "dword ";
+    case 64:  return "qword ";
+    case 80:  return "tword ";
+    case 128: return "oword ";
+    case 256: return "yword ";
+    case 512: return "zword ";
+    default:  return "";
+    }
+}
+
+/*
+ * Parse a text instruction into an insn struct.
+ */
+static void lfi_parse(const char *text, insn *result)
+{
+    char buf[256];
+    snprintf(buf, sizeof buf, "%s", text);
+    parse_line(buf, result, 64);
+}
+
+/*
+ * Validate an instruction: reject modifications to R14 and direct GS usage.
+ */
+static void lfi_validate_instruction(const insn *ins)
+{
+    int i;
+
+    /* Check for destination operand being R14 */
+    if (ins->operands >= 1 &&
+        isOpOfType(ins->oprs[0], REGISTER) &&
+        lfi_to_reg64(ins->oprs[0].basereg) == R_R14) {
+        /* Allow LEA r14, ... (used by runtime) - actually, reject all */
+        nasm_fatal("LFI: illegal modification of reserved register r14");
+    }
+
+    /* Check for GS segment usage */
+    for (i = 0; i < ins->operands; i++) {
+        if (ins->oprs[i].eaflags & EAF_GS)
+            nasm_fatal("LFI: illegal use of reserved segment register gs");
+    }
+}
+
+/*
+ * Compute NOP padding needed for bundle alignment.
+ *
+ * offset: current offset in section
+ * min_space: minimum contiguous space needed for bundle-locked group
+ * raw_size: size of the current instruction
+ * align_end: if true, pad so the instruction ends at a bundle boundary
+ *            (used for direct calls)
+ */
+static int lfi_get_padding(int64_t offset, int min_space,
+                           int64_t raw_size, bool align_end)
+{
+    int pos, remaining, pad;
+
+    if (raw_size <= 0)
+        return 0;
+
+    if (raw_size >= LFI_BUNDLE_SIZE) {
+        nasm_nonfatal("LFI: instruction size %"PRId64" exceeds bundle size",
+                      raw_size);
+        return 0;
+    }
+
+    if (min_space > LFI_BUNDLE_SIZE) {
+        nasm_nonfatal("LFI: bundle-locked group exceeds %d bytes", LFI_BUNDLE_SIZE);
+        return 0;
+    }
+
+    /* Position within the current 32-byte bundle (0..31) */
+    pos = (int)(offset % LFI_BUNDLE_SIZE);
+    remaining = LFI_BUNDLE_SIZE - pos;
+
+    /* Check if the bundle-locked group fits in the remaining space */
+    if (min_space > remaining)
+        return remaining;
+
+    if (align_end) {
+        /* Pad so instruction ends at bundle boundary */
+        int target_start = LFI_BUNDLE_SIZE - (int)raw_size;
+        pad = (target_start - pos + LFI_BUNDLE_SIZE) % LFI_BUNDLE_SIZE;
+        return pad;
+    }
+
+    /* Check if instruction would straddle a boundary */
+    if ((int)raw_size > remaining)
+        return remaining;
+
+    return 0;
+}
+
+/*
+ * =====================================================
+ * Instruction replacement functions
+ * =====================================================
+ */
+
+/*
+ * Return rewriting: ret -> pop r11; .bundle_lock; and r11d, -32;
+ *                   add r11, r14; jmp r11; .bundle_unlock
+ */
+static void lfi_expand_return(const insn *ins, struct lfi_replacement *rep)
+{
+    rep->count = 4;
+    rep->align_to_end = false;
+
+    lfi_parse("pop r11", &rep->instructions[0]);
+    rep->bundle_locked[0] = false;
+
+    lfi_parse("and r11d, 0xffffffe0", &rep->instructions[1]);
+    rep->bundle_locked[1] = true;
+
+    lfi_parse("add r11, r14", &rep->instructions[2]);
+    rep->bundle_locked[2] = true;
+
+    lfi_parse("jmp r11", &rep->instructions[3]);
+    rep->bundle_locked[3] = true;
+
+    /* Handle ret with immediate (ret N) */
+    if (ins->operands >= 1 &&
+        (ins->oprs[0].type & IMMEDIATE)) {
+        int64_t imm = ins->oprs[0].offset;
+        char buf[256];
+        /* Insert stack adjustment after pop */
+        /* Shift existing instructions 1-3 to 3-5 */
+        rep->instructions[5] = rep->instructions[3];
+        rep->bundle_locked[5] = rep->bundle_locked[3];
+        rep->instructions[4] = rep->instructions[2];
+        rep->bundle_locked[4] = rep->bundle_locked[2];
+        rep->instructions[3] = rep->instructions[1];
+        rep->bundle_locked[3] = rep->bundle_locked[1];
+
+        /* add esp, N */
+        snprintf(buf, sizeof buf, "add esp, %"PRId64, imm);
+        lfi_parse(buf, &rep->instructions[1]);
+        rep->bundle_locked[1] = true;
+
+        /* lea rsp, [rsp + r14] */
+        lfi_parse("lea rsp, [rsp + r14]", &rep->instructions[2]);
+        rep->bundle_locked[2] = true;
+
+        rep->count = 6;
+    }
+}
+
+/*
+ * Indirect jump via register: .bundle_lock; and eXd, -32; add rX, r14;
+ *                             jmp rX; .bundle_unlock
+ */
+static void lfi_expand_indirect_jmp_reg(enum reg_enum reg,
+                                        struct lfi_replacement *rep)
+{
+    char buf[256];
+    const char *r32 = lfi_reg32_name(lfi_to_reg64(reg));
+    const char *r64 = lfi_reg64_name(reg);
+
+    rep->count = 3;
+    rep->align_to_end = false;
+
+    snprintf(buf, sizeof buf, "and %s, 0xffffffe0", r32);
+    lfi_parse(buf, &rep->instructions[0]);
+    rep->bundle_locked[0] = true;
+
+    snprintf(buf, sizeof buf, "add %s, r14", r64);
+    lfi_parse(buf, &rep->instructions[1]);
+    rep->bundle_locked[1] = true;
+
+    snprintf(buf, sizeof buf, "jmp %s", r64);
+    lfi_parse(buf, &rep->instructions[2]);
+    rep->bundle_locked[2] = true;
+}
+
+/*
+ * Indirect call via register: .bundle_lock align_to_end;
+ *   and eXd, -32; add rX, r14; call rX; .bundle_unlock
+ */
+static void lfi_expand_indirect_call_reg(enum reg_enum reg,
+                                         struct lfi_replacement *rep)
+{
+    char buf[256];
+    const char *r32 = lfi_reg32_name(lfi_to_reg64(reg));
+    const char *r64 = lfi_reg64_name(reg);
+
+    rep->count = 3;
+    rep->align_to_end = true;
+
+    snprintf(buf, sizeof buf, "and %s, 0xffffffe0", r32);
+    lfi_parse(buf, &rep->instructions[0]);
+    rep->bundle_locked[0] = true;
+
+    snprintf(buf, sizeof buf, "add %s, r14", r64);
+    lfi_parse(buf, &rep->instructions[1]);
+    rep->bundle_locked[1] = true;
+
+    snprintf(buf, sizeof buf, "call %s", r64);
+    lfi_parse(buf, &rep->instructions[2]);
+    rep->bundle_locked[2] = true;
+}
+
+/*
+ * Indirect jump/call via memory: load to r11, then indirect jump/call.
+ */
+static void lfi_expand_indirect_branch_mem(const insn *ins,
+                                           struct lfi_replacement *rep,
+                                           bool is_call)
+{
+    char buf[256];
+    char memstr[256];
+    const operand *op = &ins->oprs[0];
+    const char *szpfx = lfi_size_prefix(op);
+    int n;
+
+    /* First: load the target address into r11, sandboxing the memory access */
+    if (lfi_is_safe_mem(op)) {
+        /* Safe memory: just load directly */
+        lfi_mem_string(memstr, sizeof memstr,
+                       op->basereg, op->indexreg, op->scale, op->offset);
+        snprintf(buf, sizeof buf, "mov r11, %s%s", szpfx, memstr);
+        lfi_parse(buf, &rep->instructions[0]);
+        rep->bundle_locked[0] = false;
+        n = 1;
+    } else if (!lfi_no_segue && op->indexreg == R_none) {
+        /* Segue: use gs: with 32-bit base */
+        const char *base32 = lfi_reg32_name(lfi_to_reg64(op->basereg));
+        if (base32) {
+            snprintf(buf, sizeof buf, "mov r11, qword [gs:%s + %"PRId64"]",
+                     base32, op->offset);
+        } else {
+            snprintf(buf, sizeof buf, "mov r11, qword [gs:%"PRId64"]",
+                     op->offset);
+        }
+        lfi_parse(buf, &rep->instructions[0]);
+        rep->bundle_locked[0] = false;
+        n = 1;
+    } else {
+        /* Non-segue: lea r11d, [addr]; mov r11, [r14 + r11] */
+        lfi_mem_string(memstr, sizeof memstr,
+                       op->basereg, op->indexreg, op->scale, op->offset);
+        snprintf(buf, sizeof buf, "lea r11d, %s", memstr);
+        lfi_parse(buf, &rep->instructions[0]);
+        rep->bundle_locked[0] = false;
+
+        lfi_parse("mov r11, qword [r14 + r11]", &rep->instructions[1]);
+        rep->bundle_locked[1] = true;
+        n = 2;
+    }
+
+    /* Then: sandbox and branch to r11 */
+    if (is_call) {
+        struct lfi_replacement call_rep;
+        lfi_expand_indirect_call_reg(R_R11, &call_rep);
+        for (int i = 0; i < call_rep.count; i++) {
+            rep->instructions[n + i] = call_rep.instructions[i];
+            rep->bundle_locked[n + i] = call_rep.bundle_locked[i];
+        }
+        rep->count = n + call_rep.count;
+        rep->align_to_end = true;
+    } else {
+        struct lfi_replacement jmp_rep;
+        lfi_expand_indirect_jmp_reg(R_R11, &jmp_rep);
+        for (int i = 0; i < jmp_rep.count; i++) {
+            rep->instructions[n + i] = jmp_rep.instructions[i];
+            rep->bundle_locked[n + i] = jmp_rep.bundle_locked[i];
+        }
+        rep->count = n + jmp_rep.count;
+        rep->align_to_end = false;
+    }
+}
+
+/*
+ * Direct call: bundle-lock with align_to_end so the call instruction
+ * is at the end of a bundle, making the return address bundle-aligned.
+ */
+static void lfi_expand_direct_call(const insn *ins,
+                                   struct lfi_replacement *rep)
+{
+    rep->count = 1;
+    rep->align_to_end = true;
+    rep->instructions[0] = *ins;
+    rep->bundle_locked[0] = true;
+}
+
+/*
+ * Stack pointer modification: demote to 32-bit + re-guard.
+ * General form (add rsp, 8):
+ *   .bundle_lock; add esp, 8; lea rsp, [rsp + r14]; .bundle_unlock
+ */
+static void lfi_expand_stack_modification(const insn *ins,
+                                          struct lfi_replacement *rep)
+{
+    char buf[256];
+    const char *opname = nasm_insn_names[ins->opcode];
+    bool jumps_only = lfi_no_loads && lfi_no_stores;
+
+    if (jumps_only) {
+        /* No memory sandboxing: pass through */
+        rep->count = 1;
+        rep->align_to_end = false;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+
+    /* Special case: pop rsp */
+    if (ins->opcode == I_POP && lfi_to_reg64(ins->oprs[0].basereg) == R_RSP) {
+        rep->count = 3;
+        rep->align_to_end = false;
+
+        lfi_parse("pop r11", &rep->instructions[0]);
+        rep->bundle_locked[0] = false;
+
+        lfi_parse("mov esp, r11d", &rep->instructions[1]);
+        rep->bundle_locked[1] = true;
+
+        lfi_parse("lea rsp, [rsp + r14]", &rep->instructions[2]);
+        rep->bundle_locked[2] = true;
+        return;
+    }
+
+    rep->count = 2;
+    rep->align_to_end = false;
+
+    /* Generate the 32-bit version of the stack instruction */
+    if (ins->operands >= 2 && (ins->oprs[1].type & IMMEDIATE)) {
+        snprintf(buf, sizeof buf, "%s esp, %"PRId64, opname,
+                 ins->oprs[1].offset);
+    } else if (ins->operands >= 2 && isOpOfType(ins->oprs[1], REGISTER)) {
+        const char *src32 = lfi_reg32_name(lfi_to_reg64(ins->oprs[1].basereg));
+        if (src32)
+            snprintf(buf, sizeof buf, "%s esp, %s", opname, src32);
+        else
+            snprintf(buf, sizeof buf, "%s esp, %s", opname,
+                     nasm_reg_names[ins->oprs[1].basereg - EXPR_REG_START]);
+    } else if (ins->operands >= 2 && isOpOfType(ins->oprs[1], MEMORY)) {
+        char memstr[256];
+        lfi_mem_string(memstr, sizeof memstr,
+                       ins->oprs[1].basereg, ins->oprs[1].indexreg,
+                       ins->oprs[1].scale, ins->oprs[1].offset);
+        snprintf(buf, sizeof buf, "%s esp, %s", opname, memstr);
+    } else {
+        /* Fallback: just pass through (shouldn't happen for rsp mods) */
+        rep->count = 1;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+
+    lfi_parse(buf, &rep->instructions[0]);
+    rep->bundle_locked[0] = true;
+
+    lfi_parse("lea rsp, [rsp + r14]", &rep->instructions[1]);
+    rep->bundle_locked[1] = true;
+}
+
+/*
+ * Sandbox a memory operand using the segue optimization (gs: prefix).
+ * Replaces the original instruction with a gs:-prefixed version using
+ * 32-bit address registers.
+ */
+static bool lfi_sandbox_mem_segue(const insn *ins, int mem_op_idx,
+                                  struct lfi_replacement *rep)
+{
+    char buf[512];
+    const operand *memop = &ins->oprs[mem_op_idx];
+    const char *opname = nasm_insn_names[ins->opcode];
+    const char *base32 = NULL;
+    const char *index32 = NULL;
+    char addr[256];
+
+    if (memop->basereg != R_none)
+        base32 = lfi_reg32_name(lfi_to_reg64(memop->basereg));
+    if (memop->indexreg != R_none)
+        index32 = lfi_reg32_name(lfi_to_reg64(memop->indexreg));
+
+    /* Build the address expression */
+    if (base32 && index32) {
+        if (memop->scale > 1) {
+            if (memop->offset != 0)
+                snprintf(addr, sizeof addr, "gs:%s + %s*%d + %"PRId64,
+                         base32, index32, memop->scale, memop->offset);
+            else
+                snprintf(addr, sizeof addr, "gs:%s + %s*%d",
+                         base32, index32, memop->scale);
+        } else {
+            if (memop->offset != 0)
+                snprintf(addr, sizeof addr, "gs:%s + %s + %"PRId64,
+                         base32, index32, memop->offset);
+            else
+                snprintf(addr, sizeof addr, "gs:%s + %s",
+                         base32, index32);
+        }
+    } else if (base32) {
+        if (memop->offset != 0)
+            snprintf(addr, sizeof addr, "gs:%s + %"PRId64,
+                     base32, memop->offset);
+        else
+            snprintf(addr, sizeof addr, "gs:%s", base32);
+    } else if (index32) {
+        if (memop->scale > 1) {
+            if (memop->offset != 0)
+                snprintf(addr, sizeof addr, "gs:%s*%d + %"PRId64,
+                         index32, memop->scale, memop->offset);
+            else
+                snprintf(addr, sizeof addr, "gs:%s*%d",
+                         index32, memop->scale);
+        } else {
+            if (memop->offset != 0)
+                snprintf(addr, sizeof addr, "gs:%s + %"PRId64,
+                         index32, memop->offset);
+            else
+                snprintf(addr, sizeof addr, "gs:%s", index32);
+        }
+    } else {
+        snprintf(addr, sizeof addr, "gs:%"PRId64, memop->offset);
+    }
+
+    const char *szpfx = lfi_size_prefix(memop);
+
+    /* Build the replacement instruction */
+    if (ins->operands == 2) {
+        if (mem_op_idx == 0) {
+            /* Memory is destination: op [mem], src */
+            const char *src = nasm_reg_names[ins->oprs[1].basereg - EXPR_REG_START];
+            snprintf(buf, sizeof buf, "%s %s[%s], %s",
+                     opname, szpfx, addr, src);
+        } else {
+            /* Memory is source: op dst, [mem] */
+            const char *dst = nasm_reg_names[ins->oprs[0].basereg - EXPR_REG_START];
+            snprintf(buf, sizeof buf, "%s %s, %s[%s]",
+                     opname, dst, szpfx, addr);
+        }
+    } else {
+        /* Single-operand memory instruction */
+        snprintf(buf, sizeof buf, "%s %s[%s]", opname, szpfx, addr);
+    }
+
+    rep->count = 1;
+    rep->align_to_end = false;
+    lfi_parse(buf, &rep->instructions[0]);
+    rep->bundle_locked[0] = false;
+    return true;
+}
+
+/*
+ * Sandbox a memory operand without segue (scratch register approach).
+ * For simple (base only, no index):
+ *   mov eXd, eXd; <op using [r14 + rX + offset]>  (bundle_locked)
+ * For complex (SIB/index):
+ *   lea r11d, [effective address]; <op using [r14 + r11]>  (bundle_locked)
+ */
+static void lfi_sandbox_mem_nosegue(const insn *ins, int mem_op_idx,
+                                    struct lfi_replacement *rep)
+{
+    char buf[512];
+    const operand *memop = &ins->oprs[mem_op_idx];
+    const char *opname = nasm_insn_names[ins->opcode];
+    const char *szpfx = lfi_size_prefix(memop);
+
+    if (memop->indexreg == R_none && memop->basereg != R_none) {
+        /* Simple case: base register only */
+        const char *base32 = lfi_reg32_name(lfi_to_reg64(memop->basereg));
+        const char *base64 = lfi_reg64_name(memop->basereg);
+        char memstr[256];
+
+        if (!base32 || !base64) {
+            /* Unknown register - pass through */
+            rep->count = 1;
+            rep->align_to_end = false;
+            rep->instructions[0] = *ins;
+            rep->bundle_locked[0] = false;
+            return;
+        }
+
+        rep->count = 2;
+        rep->align_to_end = false;
+
+        /* mov eXd, eXd (clears upper 32 bits) */
+        snprintf(buf, sizeof buf, "mov %s, %s", base32, base32);
+        lfi_parse(buf, &rep->instructions[0]);
+        rep->bundle_locked[0] = true;
+
+        /* op ... [r14 + rX + offset] */
+        if (memop->offset != 0)
+            snprintf(memstr, sizeof memstr, "[r14 + %s + %"PRId64"]",
+                     base64, memop->offset);
+        else
+            snprintf(memstr, sizeof memstr, "[r14 + %s]", base64);
+
+        if (ins->operands == 2) {
+            if (mem_op_idx == 0) {
+                const char *src = nasm_reg_names[ins->oprs[1].basereg - EXPR_REG_START];
+                snprintf(buf, sizeof buf, "%s %s%s, %s",
+                         opname, szpfx, memstr, src);
+            } else {
+                const char *dst = nasm_reg_names[ins->oprs[0].basereg - EXPR_REG_START];
+                snprintf(buf, sizeof buf, "%s %s, %s%s",
+                         opname, dst, szpfx, memstr);
+            }
+        } else {
+            snprintf(buf, sizeof buf, "%s %s%s", opname, szpfx, memstr);
+        }
+        lfi_parse(buf, &rep->instructions[1]);
+        rep->bundle_locked[1] = true;
+    } else {
+        /* Complex case: use lea r11d to compute address */
+        char origmem[256];
+
+        rep->count = 2;
+        rep->align_to_end = false;
+
+        lfi_mem_string(origmem, sizeof origmem,
+                       memop->basereg, memop->indexreg,
+                       memop->scale, memop->offset);
+        snprintf(buf, sizeof buf, "lea r11d, %s", origmem);
+        lfi_parse(buf, &rep->instructions[0]);
+        rep->bundle_locked[0] = true;
+
+        /* op ... [r14 + r11] */
+        if (ins->operands == 2) {
+            if (mem_op_idx == 0) {
+                const char *src = nasm_reg_names[ins->oprs[1].basereg - EXPR_REG_START];
+                snprintf(buf, sizeof buf, "%s %s[r14 + r11], %s",
+                         opname, szpfx, src);
+            } else {
+                const char *dst = nasm_reg_names[ins->oprs[0].basereg - EXPR_REG_START];
+                snprintf(buf, sizeof buf, "%s %s, %s[r14 + r11]",
+                         opname, dst, szpfx);
+            }
+        } else {
+            snprintf(buf, sizeof buf, "%s %s[r14 + r11]", opname, szpfx);
+        }
+        lfi_parse(buf, &rep->instructions[1]);
+        rep->bundle_locked[1] = true;
+    }
+}
+
+/*
+ * Expand a load/store instruction with memory sandboxing.
+ */
+static void lfi_expand_load_store(const insn *ins,
+                                  struct lfi_replacement *rep)
+{
+    int mem_op_idx = -1;
+    bool is_store = false;
+    bool jumps_only = lfi_no_loads && lfi_no_stores;
+
+    /* LEA doesn't access memory */
+    if (ins->opcode == I_LEA) {
+        rep->count = 1;
+        rep->align_to_end = false;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+
+    /* Find the memory operand */
+    for (int i = 0; i < ins->operands; i++) {
+        if ((ins->oprs[i].type & MEMORY) == MEMORY) {
+            mem_op_idx = i;
+            if (i == 0)
+                is_store = true;
+            break;
+        }
+    }
+
+    if (mem_op_idx < 0 || jumps_only) {
+        /* No memory operand or jumps-only mode: pass through */
+        rep->count = 1;
+        rep->align_to_end = false;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+
+    /* Check feature flags */
+    if (is_store && lfi_no_stores) {
+        rep->count = 1;
+        rep->align_to_end = false;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+    if (!is_store && lfi_no_loads) {
+        rep->count = 1;
+        rep->align_to_end = false;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+
+    /* Check if memory operand is safe (no rewrite needed) */
+    if (lfi_is_safe_mem(&ins->oprs[mem_op_idx])) {
+        rep->count = 1;
+        rep->align_to_end = false;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+
+    /* No base register (absolute address) - use r14 as base */
+    if (ins->oprs[mem_op_idx].basereg == R_none &&
+        ins->oprs[mem_op_idx].indexreg == R_none) {
+        rep->count = 1;
+        rep->align_to_end = false;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+
+    /* Apply sandboxing */
+    if (!lfi_no_segue) {
+        lfi_sandbox_mem_segue(ins, mem_op_idx, rep);
+    } else {
+        lfi_sandbox_mem_nosegue(ins, mem_op_idx, rep);
+    }
+}
+
+/*
+ * Expand syscall instruction.
+ * syscall -> .bundle_lock; lea r11, [rel $+6]; jmp qword [r14]; .bundle_unlock
+ *
+ * We approximate this by generating:
+ *   lea r11, [rel lfi_ret_NNNN]
+ *   jmp qword [r14]
+ *   lfi_ret_NNNN:
+ *
+ * Since NASM doesn't have anonymous labels, we use the simpler approach:
+ * the instruction sequence is bundle-locked so the return address is known.
+ */
+static void lfi_expand_syscall(const insn *ins,
+                               struct lfi_replacement *rep)
+{
+    (void)ins;
+    rep->count = 2;
+    rep->align_to_end = false;
+
+    /* lea r11, [rel $+7] (7 = size of jmp qword [r14] which is
+     * ff 26 or ff 66 00 or similar - actually jmp [r14] in 64-bit
+     * mode is: 41 ff 26 = 3 bytes. But we use the label approach.) */
+    /* Use a simpler encoding: we'll use a forward reference to next insn */
+    lfi_parse("lea r11, [rel $+7]", &rep->instructions[0]);
+    rep->bundle_locked[0] = true;
+
+    lfi_parse("jmp qword [r14]", &rep->instructions[1]);
+    rep->bundle_locked[1] = true;
+}
+
+/*
+ * Expand TLS read: mov rax, [fs:0] -> mov rax, [r15]
+ */
+static bool lfi_is_tls_read(const insn *ins)
+{
+    if (ins->opcode != I_MOV)
+        return false;
+    if (ins->operands != 2)
+        return false;
+    if (!isOpOfType(ins->oprs[0], REGISTER))
+        return false;
+    if (!(ins->oprs[1].eaflags & EAF_FS))
+        return false;
+    if (ins->oprs[1].basereg != R_none)
+        return false;
+    if (ins->oprs[1].indexreg != R_none)
+        return false;
+    if (ins->oprs[1].offset != 0)
+        return false;
+    return true;
+}
+
+static void lfi_expand_tls_read(const insn *ins,
+                                struct lfi_replacement *rep)
+{
+    char buf[256];
+    const char *dst = nasm_reg_names[ins->oprs[0].basereg - EXPR_REG_START];
+
+    rep->count = 1;
+    rep->align_to_end = false;
+
+    snprintf(buf, sizeof buf, "mov %s, [r15]", dst);
+    lfi_parse(buf, &rep->instructions[0]);
+    rep->bundle_locked[0] = false;
+}
+
+/*
+ * Expand string operations (stosb, movsb, cmpsb, etc.)
+ * Sandbox rdi (and rsi for movs/cmps) before the operation.
+ */
+static bool lfi_is_string_op(const insn *ins)
+{
+    switch (ins->opcode) {
+    case I_STOSB: case I_STOSW: case I_STOSD: case I_STOSQ:
+    case I_MOVSB: case I_MOVSW: case I_MOVSD: case I_MOVSQ:
+    case I_CMPSB: case I_CMPSW: case I_CMPSD: case I_CMPSQ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool lfi_string_has_source(const insn *ins)
+{
+    switch (ins->opcode) {
+    case I_MOVSB: case I_MOVSW: case I_MOVSD: case I_MOVSQ:
+    case I_CMPSB: case I_CMPSW: case I_CMPSD: case I_CMPSQ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void lfi_expand_string_op(const insn *ins,
+                                 struct lfi_replacement *rep)
+{
+    int n = 0;
+    bool jumps_only = lfi_no_loads && lfi_no_stores;
+    bool stores_only = lfi_no_loads && !lfi_no_stores;
+
+    if (jumps_only) {
+        rep->count = 1;
+        rep->align_to_end = false;
+        rep->instructions[0] = *ins;
+        rep->bundle_locked[0] = false;
+        return;
+    }
+
+    /* Sandbox rsi for source (movs/cmps) */
+    if (lfi_string_has_source(ins) && !stores_only) {
+        lfi_parse("mov esi, esi", &rep->instructions[n]);
+        rep->bundle_locked[n] = true;
+        n++;
+        lfi_parse("lea rsi, [r14 + rsi]", &rep->instructions[n]);
+        rep->bundle_locked[n] = true;
+        n++;
+    }
+
+    /* Sandbox rdi for destination */
+    lfi_parse("mov edi, edi", &rep->instructions[n]);
+    rep->bundle_locked[n] = true;
+    n++;
+    lfi_parse("lea rdi, [r14 + rdi]", &rep->instructions[n]);
+    rep->bundle_locked[n] = true;
+    n++;
+
+    /* The original instruction */
+    rep->instructions[n] = *ins;
+    rep->bundle_locked[n] = true;
+    n++;
+
+    rep->count = n;
+    rep->align_to_end = false;
+}
+
+/*
+ * Check if an instruction explicitly modifies RSP.
+ */
+static bool lfi_modifies_rsp(const insn *ins)
+{
+    if (ins->operands < 1)
+        return false;
+    if (!isOpOfType(ins->oprs[0], REGISTER))
+        return false;
+    if (lfi_to_reg64(ins->oprs[0].basereg) != R_RSP)
+        return false;
+    /* Only handle arithmetic modifications, not push/pop/call/ret */
+    switch (ins->opcode) {
+    case I_ADD: case I_SUB: case I_AND: case I_OR: case I_XOR:
+    case I_MOV: case I_XCHG:
+        return true;
+    default:
+        break;
+    }
+    /* POP rsp */
+    if (ins->opcode == I_POP && lfi_to_reg64(ins->oprs[0].basereg) == R_RSP)
+        return true;
+    return false;
+}
+
+/*
+ * Check if an instruction is an indirect branch (jmp or call via register
+ * or memory, not direct/relative).
+ */
+static bool lfi_is_indirect_branch(const insn *ins)
+{
+    if (ins->opcode != I_JMP && ins->opcode != I_CALL)
+        return false;
+    if (ins->operands < 1)
+        return false;
+    /* Direct call/jmp has an immediate operand */
+    if (ins->oprs[0].type & IMMEDIATE)
+        return false;
+    /* Register or memory operand = indirect */
+    return true;
+}
+
+static bool lfi_is_direct_call(const insn *ins)
+{
+    if (ins->opcode != I_CALL)
+        return false;
+    if (ins->operands < 1)
+        return false;
+    /* Direct call has an immediate operand (label) */
+    if (ins->oprs[0].type & IMMEDIATE)
+        return true;
+    return false;
+}
+
+static bool lfi_is_return(const insn *ins)
+{
+    switch (ins->opcode) {
+    case I_RET: case I_RETW: case I_RETD: case I_RETQ:
+    case I_RETN: case I_RETNW: case I_RETND: case I_RETNQ:
+    case I_RETF: case I_RETFW: case I_RETFD: case I_RETFQ:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * Main dispatch: generate replacement instruction sequence for an instruction.
+ */
+static void lfi_replace_instruction(const insn *ins,
+                                    struct lfi_replacement *rep)
+{
+    memset(rep, 0, sizeof(*rep));
+    rep->count = 1;
+    rep->align_to_end = false;
+    rep->instructions[0] = *ins;
+    rep->bundle_locked[0] = false;
+
+    /* Syscall */
+    if (ins->opcode == I_SYSCALL) {
+        lfi_expand_syscall(ins, rep);
+        return;
+    }
+
+    /* TLS read */
+    if (lfi_is_tls_read(ins)) {
+        lfi_expand_tls_read(ins, rep);
+        return;
+    }
+
+    /* Return */
+    if (lfi_is_return(ins)) {
+        lfi_expand_return(ins, rep);
+        return;
+    }
+
+    /* Direct call */
+    if (lfi_is_direct_call(ins)) {
+        lfi_expand_direct_call(ins, rep);
+        return;
+    }
+
+    /* Indirect branch (jmp/call via register or memory) */
+    if (lfi_is_indirect_branch(ins)) {
+        if (isOpOfType(ins->oprs[0], REGISTER)) {
+            if (ins->opcode == I_CALL)
+                lfi_expand_indirect_call_reg(ins->oprs[0].basereg, rep);
+            else
+                lfi_expand_indirect_jmp_reg(ins->oprs[0].basereg, rep);
+        } else {
+            lfi_expand_indirect_branch_mem(ins, rep,
+                                           ins->opcode == I_CALL);
+        }
+        return;
+    }
+
+    /* String operations */
+    if (lfi_is_string_op(ins)) {
+        lfi_expand_string_op(ins, rep);
+        return;
+    }
+
+    /* Stack pointer modification */
+    if (lfi_modifies_rsp(ins)) {
+        lfi_expand_stack_modification(ins, rep);
+        return;
+    }
+
+    /* Load/store with memory operand: sandbox the memory access */
+    lfi_expand_load_store(ins, rep);
+}
+
+/*
+ * Multi-byte NOP table (Intel-recommended sequences).
+ * Index is the NOP size in bytes (1-9).
+ */
+static const char *lfi_nop_table[] = {
+    NULL,
+    "nop",                                                          /* 1: 90 */
+    "db 0x66, 0x90",                                                /* 2: 66 90 */
+    "db 0x0f, 0x1f, 0x00",                                         /* 3: 0f 1f 00 */
+    "db 0x0f, 0x1f, 0x40, 0x00",                                   /* 4: 0f 1f 40 00 */
+    "db 0x0f, 0x1f, 0x44, 0x00, 0x00",                             /* 5: 0f 1f 44 00 00 */
+    "db 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00",                       /* 6: 66 0f 1f 44 00 00 */
+    "db 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00",                 /* 7: 0f 1f 80 00 00 00 00 */
+    "db 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00",           /* 8: 0f 1f 84 00 00 00 00 00 */
+    "db 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00",    /* 9: 66 0f 1f 84 00 00 00 00 00 */
+};
+#define LFI_MAX_NOP_SIZE 9
+
+/*
+ * Emit N bytes of NOP padding via process_insn().
+ * Uses multi-byte NOPs for better performance.
+ */
+static void lfi_emit_nop_padding(int nbytes)
+{
+    insn nop_ins;
+    while (nbytes > 0) {
+        int sz = (nbytes > LFI_MAX_NOP_SIZE) ? LFI_MAX_NOP_SIZE : nbytes;
+        lfi_parse(lfi_nop_table[sz], &nop_ins);
+        nop_ins.times = 1;
+        process_insn(&nop_ins);
+        cleanup_insn(&nop_ins);
+        nbytes -= sz;
+    }
+}
+
+/*
+ * Compute the total size of a group of replacement instructions.
+ * Each instruction must have loc set for insn_size() to work.
+ */
+static int64_t lfi_group_size(struct lfi_replacement *rep,
+                              int start, int end)
+{
+    int64_t total = 0;
+    for (int i = start; i < end; i++) {
+        rep->instructions[i].loc = location;
+        rep->instructions[i].times = 1;
+        int64_t sz = insn_size(&rep->instructions[i]);
+        if (sz < 0)
+            sz = 0;
+        total += sz;
+    }
+    return total;
+}
+
+/*
+ * Process a single instruction through the LFI layer.
+ * This replaces the direct call to process_insn() in assemble_file().
+ *
+ * The approach: generate replacement instructions, then for each one
+ * check if padding is needed for bundle alignment. Emit NOP padding
+ * as needed, then emit the replacement instruction via process_insn().
+ *
+ * Bundle-locked groups must not cross a 32-byte boundary.
+ * align_to_end means the last instruction in the group should end
+ * at a 32-byte boundary (for calls, so return address is aligned).
+ *
+ * The multi-pass assembler will converge because the same replacement
+ * logic runs identically each pass (padding depends only on offset).
+ */
+static void lfi_process_instruction(insn *ins)
+{
+    struct lfi_replacement rep;
+    int32_t times_save = ins->times;
+    int32_t t;
+
+    if (ins->opcode == I_none) {
+        process_insn(ins);
+        return;
+    }
+
+    /* Validate reserved register usage */
+    lfi_validate_instruction(ins);
+
+    /* Get the replacement sequence */
+    lfi_replace_instruction(ins, &rep);
+
+    if (rep.count == 1 && !rep.bundle_locked[0] && !rep.align_to_end) {
+        /* Single replacement, no bundling needed */
+        rep.instructions[0].times = ins->times;
+        process_insn(&rep.instructions[0]);
+        return;
+    }
+
+    /* Handle TIMES: iterate manually with times=1 */
+    t = (times_save > 0) ? times_save : 1;
+
+    while (t-- > 0) {
+        /*
+         * Find the start of each bundle-locked group and compute
+         * the total group size. Emit padding before the group if needed.
+         */
+        int i = 0;
+        while (i < rep.count) {
+            insn *ri = &rep.instructions[i];
+            ri->times = 1;
+
+            if (!rep.bundle_locked[i]) {
+                /* Not bundle-locked: just emit it */
+                process_insn(ri);
+                i++;
+                continue;
+            }
+
+            /*
+             * Start of a bundle-locked group. Find the end.
+             */
+            int group_start = i;
+            int group_end = i;
+            while (group_end < rep.count && rep.bundle_locked[group_end])
+                group_end++;
+
+            /*
+             * Compute the total size of the bundle-locked group
+             * using insn_size() for each instruction.
+             */
+            int64_t group_sz = lfi_group_size(&rep, group_start, group_end);
+
+            /*
+             * Compute required padding using lfi_get_padding().
+             * For align_to_end (calls): the group should end at a
+             * bundle boundary so the return address is aligned.
+             * Otherwise: ensure the group doesn't cross a boundary.
+             */
+            bool is_end_group = rep.align_to_end && (group_end == rep.count);
+            int pad = lfi_get_padding(location.offset, (int)group_sz,
+                                      group_sz, is_end_group);
+            if (pad > 0)
+                lfi_emit_nop_padding(pad);
+
+            /* Emit all instructions in the bundle-locked group */
+            for (int j = group_start; j < group_end; j++) {
+                insn *gri = &rep.instructions[j];
+                gri->times = 1;
+                process_insn(gri);
+            }
+            i = group_end;
+        }
+    }
+}
+
 static void assemble_file(const char *fname, struct strlist *depend_list)
 {
     char *line;
     insn output_ins;
     uint64_t prev_offset_changed;
     int64_t stall_count = 0; /* Make sure we make forward progress... */
+
+    if (lfi_mode && cmd_sb != 64)
+        nasm_fatal("--lfi requires 64-bit mode");
 
     switch (cmd_sb) {
     case 16:
@@ -1660,6 +2900,18 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
                            nasm_limit[LIMIT_LINES]);
 
             /*
+             * LFI: align non-local labels to 32-byte boundaries.
+             */
+            if (lfi_mode && parse_check_is_label(line) &&
+                !is_local_label(line)) {
+                int pad = (LFI_BUNDLE_SIZE -
+                           (int)(location.offset % LFI_BUNDLE_SIZE))
+                          % LFI_BUNDLE_SIZE;
+                if (pad > 0)
+                    lfi_emit_nop_padding(pad);
+            }
+
+            /*
              * Here we parse our directives; this is not handled by the
              * main parser.
              */
@@ -1669,7 +2921,11 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
             /* Not a directive, or even something that starts with [ */
             parse_line(line, &output_ins, globl.bits);
             forward_refs(&output_ins);
-            process_insn(&output_ins);
+            if (lfi_mode && output_ins.opcode != I_none) {
+                lfi_process_instruction(&output_ins);
+            } else {
+                process_insn(&output_ins);
+            }
             cleanup_insn(&output_ins);
 
         end_of_line:

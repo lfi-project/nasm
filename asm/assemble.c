@@ -73,7 +73,7 @@ enum match_result {
         (((mod) << 6) | (((reg) & 7) << 3) | ((rm) & 7))
 
 static int64_t assemble(insn *instruction);
-static int64_t insn_size(insn *instruction);
+int64_t insn_size(insn *instruction);
 
 static int64_t calcsize(insn *, const struct itemplate *);
 static int64_t calcsize_speculative(const insn *, const struct itemplate *);
@@ -1227,7 +1227,7 @@ static int64_t len_extops(const extop *e)
     return isize;
 }
 
-static int64_t insn_size(insn *instruction)
+int64_t insn_size(insn *instruction)
 {
     const struct itemplate *temp;
     enum match_result m;

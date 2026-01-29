@@ -328,6 +328,9 @@ bool process_directives(char *directive)
         } else {
             globl.bits = sb;
             switch_segment(seg);
+            /* LFI: enforce minimum 32-byte section alignment */
+            if (lfi_mode)
+                ofmt->sectalign(seg, 32);
         }
         break;
     }
@@ -355,6 +358,10 @@ bool process_directives(char *directive)
 		    nasm_nonfatal("absurdly large segment alignment `%s' (2^%d)",
 				  value, ilog2_64(align));
                 }
+
+                /* LFI: enforce minimum 32-byte alignment */
+                if (lfi_mode && align < 32)
+                    align = 32;
 
                 /* callee should be able to handle all details */
                 if (location.segment != NO_SEG)

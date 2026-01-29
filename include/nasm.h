@@ -1574,6 +1574,12 @@ void reset_global_defaults(int bits);
 extern const char *inname;	/* primary input filename */
 extern const char *outname;     /* output filename */
 
+/* LFI (Lightweight Fault Isolation) mode */
+extern bool lfi_mode;
+extern bool lfi_no_loads;
+extern bool lfi_no_stores;
+extern bool lfi_no_segue;
+
 /*
  * Switch to a different segment and return the current offset
  */

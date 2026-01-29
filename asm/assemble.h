@@ -19,6 +19,7 @@ extern bool in_absolute;        /* Are we in an absolute segment? */
 extern struct location absolute;
 
 int64_t increment_offset(int64_t delta);
+int64_t insn_size(insn *instruction);
 void process_insn(insn *instruction);
 
 bool directive_valid(const char *);
