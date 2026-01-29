@@ -1579,6 +1579,7 @@ extern bool lfi_mode;
 extern bool lfi_no_loads;
 extern bool lfi_no_stores;
 extern bool lfi_no_segue;
+extern bool lfi_no_align_labels;
 
 /*
  * Switch to a different segment and return the current offset

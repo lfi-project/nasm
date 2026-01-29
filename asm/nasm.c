@@ -94,6 +94,7 @@ bool lfi_mode = false;
 bool lfi_no_loads = false;
 bool lfi_no_stores = false;
 bool lfi_no_segue = false;
+bool lfi_no_align_labels = false;
 
 static struct RAA *offsets;
 
@@ -895,7 +896,8 @@ enum text_options {
     OPT_LFI,
     OPT_NO_LFI_LOADS,
     OPT_NO_LFI_STORES,
-    OPT_NO_LFI_SEGUE
+    OPT_NO_LFI_SEGUE,
+    OPT_NO_LFI_ALIGN_LABELS
 };
 enum need_arg {
     ARG_NO,
@@ -938,6 +940,7 @@ static const struct textargs textopts[] = {
     {"no-lfi-loads",  OPT_NO_LFI_LOADS, ARG_NO, 0},
     {"no-lfi-stores", OPT_NO_LFI_STORES, ARG_NO, 0},
     {"no-lfi-segue",  OPT_NO_LFI_SEGUE, ARG_NO, 0},
+    {"no-lfi-align-labels", OPT_NO_LFI_ALIGN_LABELS, ARG_NO, 0},
     {NULL, OPT_BOGUS, ARG_NO, 0}
 };
 
@@ -1330,6 +1333,9 @@ static bool process_arg(char *p, char *q, int pass)
                     break;
                 case OPT_NO_LFI_SEGUE:
                     lfi_no_segue = true;
+                    break;
+                case OPT_NO_LFI_ALIGN_LABELS:
+                    lfi_no_align_labels = true;
                     break;
                 case OPT_HELP:
                     /* Allow --help topic without *requiring* topic */
@@ -2900,10 +2906,11 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
                            nasm_limit[LIMIT_LINES]);
 
             /*
-             * LFI: align non-local labels to 32-byte boundaries.
+             * LFI: align labels to 32-byte bundle boundaries so that
+             * direct jump targets are always bundle-aligned.
              */
-            if (lfi_mode && parse_check_is_label(line) &&
-                !is_local_label(line)) {
+            if (lfi_mode && !lfi_no_align_labels &&
+                parse_check_is_label(line)) {
                 int pad = (LFI_BUNDLE_SIZE -
                            (int)(location.offset % LFI_BUNDLE_SIZE))
                           % LFI_BUNDLE_SIZE;

@@ -23,6 +23,7 @@ memory accesses are sandboxed:
 | `--no-lfi-loads` | Do not sandbox load instructions |
 | `--no-lfi-stores` | Do not sandbox store instructions |
 | `--no-lfi-segue` | Do not use the `gs` segment for memory sandboxing |
+| `--no-lfi-align-labels` | Do not align labels to bundle boundaries |
 
 Use `--no-lfi-loads` for a stores-only sandbox that may read outside the
 sandbox but cannot write outside it.
@@ -196,9 +197,10 @@ mov rax, [fs:0]        mov rax, [r15]
 
 ## Bundle Alignment
 
-All labels (except local labels starting with `.`) are aligned to
-32-byte bundle boundaries. Sections have a minimum alignment of 32
-bytes.
+All labels are aligned to 32-byte bundle boundaries so that direct
+jump and call targets are always bundle-aligned. Use
+`--no-lfi-align-labels` to disable label alignment. Sections have a
+minimum alignment of 32 bytes.
 
 Bundle-locked instruction groups are guaranteed to fit within a single
 32-byte bundle. NOP padding is inserted before groups that would
