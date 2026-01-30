@@ -97,6 +97,37 @@ ret               pop r11
                   .bundle_unlock
 ```
 
+**Flag-preserving return (`lfi_ret`):**
+
+The standard return rewrite uses `and` and `add` to sandbox the return
+address, which clobbers the CPU flags register (EFLAGS). Some hand-written
+assembly relies on flags being preserved across `ret` (e.g., setting flags
+before `ret` in a subroutine and testing them with `jcc` after `call` in
+the caller).
+
+The `lfi_ret` pseudo-instruction provides a return sequence that does not
+modify flags. It uses BMI2 `shrx`/`shlx` to clear the low 5 bits (bundle
+alignment) and `lea` to add the sandbox base:
+
+```
+; lfi_ret expands to:
+pop r11
+.bundle_lock
+push rax
+mov eax, 5
+shrx r11d, r11d, eax
+shlx r11d, r11d, eax
+pop rax
+lea r11, [r14 + r11]
+jmp r11
+.bundle_unlock
+```
+
+None of the instructions in the bundle-locked group modify EFLAGS:
+`push`/`pop`, `mov`, `shrx`, `shlx`, `lea`, and `jmp` all preserve flags.
+
+When LFI is not enabled, `lfi_ret` assembles as a plain `ret`.
+
 **Direct call:**
 
 ```
@@ -125,7 +156,25 @@ The following addressing modes are safe and not rewritten:
 
 - `rsp`-based (stack pointer is always valid)
 - `rip`-relative (code is within the sandbox)
+- `r15`-based with no index (virtual register file access, when `--lfi-vregs`)
 - `lea` instructions (no memory access)
+
+**AVX-512 gather/scatter and VSIB addressing**: Memory sandboxing uses
+struct copy of the parsed instruction to preserve mask register
+decorators (`{k1}`, `{k2}`, etc.) and vector index registers (ymm/zmm
+in VSIB addressing). For VSIB instructions in no-segue mode, the base
+register is sandboxed via a 3-instruction sequence that masks and
+relocates the base while preserving the vector index:
+
+```
+; Original:                                ; Rewritten (no-segue):
+vpgatherdd zmm1{k1}, [rbx + zmm0*4]       mov r11d, ebx
+                                           add r11, r14
+                                           vpgatherdd zmm1{k1}, [r11 + zmm0*4]
+```
+
+**Data directives** (`db`, `dw`, `dd`, `dq`, `resb`, etc.) are passed
+through without LFI processing.
 
 With `--no-lfi-segue`, memory sandboxing uses a scratch register instead:
 
@@ -254,6 +303,35 @@ add r14, [rdi]           mov r11, [r15 + 48]
                          mov [r15 + 48], r11
 ```
 
+When the same reserved register appears in both the register operand and
+the memory operand's addressing mode, both references are substituted
+with `r11`:
+
+```
+; Original:                  ; Rewritten:
+lea r14, [r14 + rsi*2]       mov r11, [r15 + 48]
+                             lea r11, [r11 + rsi*2]
+                             mov [r15 + 48], r11
+```
+
+When a different reserved register appears in the memory operand's
+addressing mode, a temporary GPR is saved/restored via `push`/`pop` to
+hold the addressing-mode register value:
+
+```
+; Original:                      ; Rewritten:
+movzx r11d, byte [r15+rbp*2]    push rax
+                                 mov rax, [r15 + 56]    ; load virtual r15 (addr)
+                                 mov r11, [r15 + 40]    ; load virtual r11 (dest)
+                                 movzx r11d, byte [rax+rbp*2]
+                                 mov [r15 + 40], r11
+                                 pop rax
+```
+
+The temporary GPR is chosen automatically from registers not used by the
+instruction's operands. `push`/`pop` do not modify flags, so flag state
+is preserved.
+
 **Reserved register in addressing mode**:
 
 ```
@@ -261,6 +339,26 @@ add r14, [rdi]           mov r11, [r15 + 48]
 mov rax, [r14 + rbx]      mov r11, [r15 + 48]
                            mov rax, [r11 + rbx]
 ```
+
+**Two reserved registers in addressing mode** (e.g., `[r11 + r15*4 + disp]`):
+
+When both base and index are reserved, a single scratch register is not
+enough. A temporary GPR is saved/restored via `push`/`pop` (which are
+safe in LFI and do not need rewriting):
+
+```
+; Original:                      ; Rewritten:
+movsxd rbx, [r11 + r15*4 + 16]  push rax
+                                 mov rax, [r15 + 56]    ; load virtual r15 (index)
+                                 mov r11, [r15 + 40]    ; load virtual r11 (base)
+                                 lea r11, [r11+rax*4+16]; compute effective address
+                                 movsxd rbx, [r11]      ; execute with computed addr
+                                 pop rax
+```
+
+The temporary GPR is chosen automatically from registers not used by the
+instruction's operands. `push`/`pop` and `lea` do not modify flags, so
+flag state is preserved.
 
 **Two reserved registers**:
 
@@ -282,6 +380,24 @@ pop r14                  pop r11
                          mov [r15 + 48], r11
 ```
 
+**Indirect branch via reserved register** (`call`/`jmp`):
+
+The register operand is a read-only branch target; there is no
+store-back (the register is not modified by the branch, and `r11` is
+clobbered by the indirect branch rewrite sequence and by the callee):
+
+```
+; Original:              ; Rewritten:
+call r14                 mov r11, [r15 + 48]
+                         call r11
+
+jmp r14                  mov r11, [r15 + 48]
+                         jmp r11
+```
+
+Each expanded instruction then goes through the normal LFI indirect
+branch rewriting (`and`/`add`/`call` or `and`/`add`/`jmp`).
+
 **32-bit writes** (zero-extension):
 
 ```
@@ -298,13 +414,101 @@ mov r14w, ax             mov word [r15 + 48], ax
 mov r14b, al             mov byte [r15 + 48], al
 ```
 
-**xchg**:
+**xchg** (one reserved register):
 
 ```
 ; Original:              ; Rewritten:
 xchg r14, rax            mov r11, [r15 + 48]
                          mov [r15 + 48], rax
                          mov rax, r11
+```
+
+**xchg** (both reserved registers):
+
+A temporary GPR is saved/restored via `push`/`pop` to hold one value
+while both virtual register file slots are swapped:
+
+```
+; Original:              ; Rewritten:
+xchg r14, r11            push rax
+                         mov rax, [r15 + 48]
+                         mov r11, [r15 + 40]
+                         mov [r15 + 48], r11
+                         mov [r15 + 40], rax
+                         pop rax
+```
+
+**xadd** (both operands modified):
+
+`xadd` modifies both operands: the source receives the old destination
+value, and the destination receives the sum. The virtual register is
+always stored back, even when it appears as the source operand:
+
+```
+; Original:              ; Rewritten:
+xadd rax, r14            mov r11, [r15 + 48]
+                         xadd rax, r11
+                         mov [r15 + 48], r11
+```
+
+**64-bit immediates**:
+
+`mov r/m64, imm32` sign-extends a 32-bit immediate, so values that do
+not fit in a signed 32-bit integer must go through `r11`:
+
+```
+; Original:                         ; Rewritten:
+mov r15, 0x0000000f0000000f         mov r11, 0x0000000f0000000f
+                                    mov [r15 + 56], r11
+```
+
+**3+ operand instructions** (BMI2/VEX such as `rorx`, `shrx`, `shlx`):
+
+When the third operand is an immediate, the instruction is handled via
+struct copy of the parsed instruction, which preserves all operands:
+
+```
+; Original:              ; Rewritten:
+rorx r11d, ebx, 8       rorx r11d, ebx, 8     ; struct copy, dest unchanged
+                         mov [r15 + 40], r11   ; store to virtual r11
+```
+
+When the third operand is a reserved register, it is loaded into `r11`
+before execution. If the destination is also reserved, `r11` serves as
+both the third operand (input) and the destination (output), since
+BMI2/VEX 3-operand instructions have write-only destinations:
+
+```
+; Original:              ; Rewritten:
+shlx eax, eax, r14d     mov r11, [r15 + 48]   ; load virtual r14 (shift count)
+                         shlx eax, eax, r11d   ; use r11d as shift count
+
+shlx r14d, eax, r11d    mov r11, [r15 + 40]   ; load virtual r11 (shift count)
+                         shlx r11d, eax, r11d  ; r11d is both dest and count
+                         mov [r15 + 48], r11   ; store to virtual r14
+```
+
+When the third operand is an immediate and both destination and source
+are reserved, the source is read from the virtual register file as a
+memory operand while preserving the immediate:
+
+```
+; Original:              ; Rewritten:
+imul r14, r11, 5         mov r11, [r15 + 48]
+                         imul r11, qword [r15 + 40], 5
+                         mov [r15 + 48], r11
+```
+
+**Size-extending moves** (`movzx`, `movsx`):
+
+When both destination and source are reserved, the source memory operand
+uses the source register's actual size, not the destination size:
+
+```
+; Original:              ; Rewritten:
+movzx r14d, r11b        mov r11, [r15 + 48]         ; pre-load dest
+                         movzx r11d, byte [r15 + 40] ; byte, not dword
+                         mov [r15 + 48], r11
 ```
 
 ### Flags Preservation
@@ -315,10 +519,13 @@ preserved through virtual register load/store sequences.
 
 ## Bundle Alignment
 
-All labels are aligned to 32-byte bundle boundaries so that direct
-jump and call targets are always bundle-aligned. Use
-`--no-lfi-align-labels` to disable label alignment. Sections have a
-minimum alignment of 32 bytes.
+Labels in `.text` (executable) sections are aligned to 32-byte bundle
+boundaries so that direct jump and call targets are always
+bundle-aligned. Labels in data sections (`.rodata`, `.data`, `.bss`,
+etc.) are never aligned, since inserting NOP padding into data
+sections would corrupt the data. Use `--no-lfi-align-labels` to
+disable label alignment entirely. Sections have a minimum alignment
+of 32 bytes.
 
 Bundle-locked instruction groups are guaranteed to fit within a single
 32-byte bundle. NOP padding is inserted before groups that would

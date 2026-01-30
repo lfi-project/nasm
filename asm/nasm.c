@@ -96,6 +96,7 @@ bool lfi_no_stores = false;
 bool lfi_no_segue = false;
 bool lfi_no_align_labels = false;
 bool lfi_vregs = false;
+bool lfi_in_text_section = false;
 
 static struct RAA *offsets;
 
@@ -1657,6 +1658,33 @@ static const char *lfi_reg32_name(enum reg_enum reg)
 }
 
 /*
+ * Map a 64-bit GPR enum to its 32-bit enum equivalent.
+ * Returns R_none for non-GPR registers (e.g., vector registers).
+ */
+static enum reg_enum lfi_to_reg32(enum reg_enum reg)
+{
+    switch (reg) {
+    case R_RAX: return R_EAX;
+    case R_RBX: return R_EBX;
+    case R_RCX: return R_ECX;
+    case R_RDX: return R_EDX;
+    case R_RSI: return R_ESI;
+    case R_RDI: return R_EDI;
+    case R_RBP: return R_EBP;
+    case R_RSP: return R_ESP;
+    case R_R8:  return R_R8D;
+    case R_R9:  return R_R9D;
+    case R_R10: return R_R10D;
+    case R_R11: return R_R11D;
+    case R_R12: return R_R12D;
+    case R_R13: return R_R13D;
+    case R_R14: return R_R14D;
+    case R_R15: return R_R15D;
+    default:    return R_none;
+    }
+}
+
+/*
  * Map a 64-bit register enum to its 64-bit name string.
  */
 static const char *lfi_reg64_name(enum reg_enum reg)
@@ -1768,6 +1796,81 @@ static int lfi_reg_size(enum reg_enum reg)
 }
 
 /*
+ * Convert a reserved register to the R11 variant of the same size.
+ */
+static enum reg_enum lfi_to_r11(enum reg_enum reg)
+{
+    switch (lfi_reg_size(reg)) {
+    case 8:  return R_R11B;
+    case 16: return R_R11W;
+    case 32: return R_R11D;
+    default: return R_R11;
+    }
+}
+
+/*
+ * Return the r11 register name for a given operand size in bits.
+ */
+static const char *lfi_r11_name(int sz)
+{
+    switch (sz) {
+    case 8:  return "r11b";
+    case 16: return "r11w";
+    case 32: return "r11d";
+    default: return "r11";
+    }
+}
+
+/*
+ * Return the size prefix string for a given operand size in bits.
+ */
+static const char *lfi_vreg_size_str(int sz)
+{
+    switch (sz) {
+    case 8:  return "byte";
+    case 16: return "word";
+    case 32: return "dword";
+    default: return "qword";
+    }
+}
+
+/*
+ * Find a 64-bit GPR not used by any register operand of the instruction
+ * and not reserved/special. Used as a temporary when two reserved registers
+ * appear in an addressing mode.
+ */
+static enum reg_enum lfi_find_temp_gpr(const insn *ins)
+{
+    static const enum reg_enum candidates[] = {
+        R_RAX, R_RCX, R_RDX, R_RBX, R_RSI, R_RDI, R_RBP,
+        R_R8, R_R9, R_R10, R_R12, R_R13,
+    };
+    int ncand = (int)(sizeof(candidates) / sizeof(candidates[0]));
+
+    for (int c = 0; c < ncand; c++) {
+        bool used = false;
+        for (int i = 0; i < ins->operands && !used; i++) {
+            if (isOpOfType(ins->oprs[i], REGISTER)) {
+                if (lfi_to_reg64(ins->oprs[i].basereg) == candidates[c])
+                    used = true;
+            }
+            if ((ins->oprs[i].type & MEMORY) == MEMORY) {
+                if (ins->oprs[i].basereg != R_none &&
+                    lfi_to_reg64(ins->oprs[i].basereg) == candidates[c])
+                    used = true;
+                if (ins->oprs[i].indexreg != R_none &&
+                    lfi_to_reg64(ins->oprs[i].indexreg) == candidates[c])
+                    used = true;
+            }
+        }
+        if (!used)
+            return candidates[c];
+    }
+    nasm_fatal("LFI: cannot find free register for virtual register expansion");
+    return R_none;
+}
+
+/*
  * Check if an instruction has any virtual register references
  * (reserved registers used in operands).
  */
@@ -1874,6 +1977,33 @@ static const char *lfi_size_prefix(const operand *op)
 }
 
 /*
+ * Rebuild an instruction string, replacing the memory operand at mem_op_idx
+ * with new_mem (including size prefix and brackets). Non-memory operands are
+ * emitted by their register name. Handles any number of operands.
+ */
+static void lfi_rebuild_insn(char *buf, size_t bufsz,
+                             const insn *ins, int mem_op_idx,
+                             const char *szpfx, const char *new_mem)
+{
+    const char *opname = nasm_insn_names[ins->opcode];
+    int off = snprintf(buf, bufsz, "%s ", opname);
+
+    for (int i = 0; i < ins->operands && off < (int)bufsz; i++) {
+        if (i > 0)
+            off += snprintf(buf + off, bufsz - off, ", ");
+        if (i == mem_op_idx) {
+            off += snprintf(buf + off, bufsz - off, "%s%s", szpfx, new_mem);
+        } else if (isOpOfType(ins->oprs[i], REGISTER)) {
+            const char *rn = nasm_reg_names[ins->oprs[i].basereg - EXPR_REG_START];
+            off += snprintf(buf + off, bufsz - off, "%s", rn);
+        } else if (ins->oprs[i].type & IMMEDIATE) {
+            off += snprintf(buf + off, bufsz - off, "%"PRId64,
+                            ins->oprs[i].offset);
+        }
+    }
+}
+
+/*
  * Parse a text instruction into an insn struct.
  */
 static void lfi_parse(const char *text, insn *result)
@@ -1938,8 +2068,13 @@ static int lfi_get_padding(int64_t offset, int min_space,
     remaining = LFI_BUNDLE_SIZE - pos;
 
     /* Check if the bundle-locked group fits in the remaining space */
-    if (min_space > remaining)
+    if (min_space > remaining) {
+        if (align_end) {
+            /* Skip to next bundle, then align so group ends at boundary */
+            return remaining + (LFI_BUNDLE_SIZE - (int)raw_size);
+        }
         return remaining;
+    }
 
     if (align_end) {
         /* Pad so instruction ends at bundle boundary */
@@ -1960,6 +2095,48 @@ static int lfi_get_padding(int64_t offset, int min_space,
  * Instruction replacement functions
  * =====================================================
  */
+
+/*
+ * Flag-preserving return (rep ret / ret_with_flags).
+ * Uses BMI2 shrx/shlx to clear the low 5 bits of the return address
+ * without modifying EFLAGS. Every instruction in the sequence preserves
+ * flags, matching the behavior of the original ret instruction.
+ *
+ * pop r11; .bundle_lock; push rax; mov eax, 5; shrx r11d, r11d, eax;
+ * shlx r11d, r11d, eax; pop rax; lea r11, [r14+r11]; jmp r11;
+ * .bundle_unlock
+ */
+static void lfi_expand_return_with_flags(struct lfi_replacement *rep)
+{
+    int n = 0;
+    rep->align_to_end = false;
+
+    lfi_parse("pop r11", &rep->instructions[n]);
+    rep->bundle_locked[n++] = false;
+
+    lfi_parse("push rax", &rep->instructions[n]);
+    rep->bundle_locked[n++] = true;
+
+    lfi_parse("mov eax, 5", &rep->instructions[n]);
+    rep->bundle_locked[n++] = true;
+
+    lfi_parse("shrx r11d, r11d, eax", &rep->instructions[n]);
+    rep->bundle_locked[n++] = true;
+
+    lfi_parse("shlx r11d, r11d, eax", &rep->instructions[n]);
+    rep->bundle_locked[n++] = true;
+
+    lfi_parse("pop rax", &rep->instructions[n]);
+    rep->bundle_locked[n++] = true;
+
+    lfi_parse("lea r11, [r14 + r11]", &rep->instructions[n]);
+    rep->bundle_locked[n++] = true;
+
+    lfi_parse("jmp r11", &rep->instructions[n]);
+    rep->bundle_locked[n++] = true;
+
+    rep->count = n;
+}
 
 /*
  * Return rewriting: ret -> pop r11; .bundle_lock; and r11d, -32;
@@ -2226,84 +2403,41 @@ static void lfi_expand_stack_modification(const insn *ins,
 static bool lfi_sandbox_mem_segue(const insn *ins, int mem_op_idx,
                                   struct lfi_replacement *rep)
 {
-    char buf[512];
-    const operand *memop = &ins->oprs[mem_op_idx];
-    const char *opname = nasm_insn_names[ins->opcode];
-    const char *base32 = NULL;
-    const char *index32 = NULL;
-    char addr[256];
-
-    if (memop->basereg != R_none)
-        base32 = lfi_reg32_name(lfi_to_reg64(memop->basereg));
-    if (memop->indexreg != R_none)
-        index32 = lfi_reg32_name(lfi_to_reg64(memop->indexreg));
-
-    /* Build the address expression */
-    if (base32 && index32) {
-        if (memop->scale > 1) {
-            if (memop->offset != 0)
-                snprintf(addr, sizeof addr, "gs:%s + %s*%d + %"PRId64,
-                         base32, index32, memop->scale, memop->offset);
-            else
-                snprintf(addr, sizeof addr, "gs:%s + %s*%d",
-                         base32, index32, memop->scale);
-        } else {
-            if (memop->offset != 0)
-                snprintf(addr, sizeof addr, "gs:%s + %s + %"PRId64,
-                         base32, index32, memop->offset);
-            else
-                snprintf(addr, sizeof addr, "gs:%s + %s",
-                         base32, index32);
-        }
-    } else if (base32) {
-        if (memop->offset != 0)
-            snprintf(addr, sizeof addr, "gs:%s + %"PRId64,
-                     base32, memop->offset);
-        else
-            snprintf(addr, sizeof addr, "gs:%s", base32);
-    } else if (index32) {
-        if (memop->scale > 1) {
-            if (memop->offset != 0)
-                snprintf(addr, sizeof addr, "gs:%s*%d + %"PRId64,
-                         index32, memop->scale, memop->offset);
-            else
-                snprintf(addr, sizeof addr, "gs:%s*%d",
-                         index32, memop->scale);
-        } else {
-            if (memop->offset != 0)
-                snprintf(addr, sizeof addr, "gs:%s + %"PRId64,
-                         index32, memop->offset);
-            else
-                snprintf(addr, sizeof addr, "gs:%s", index32);
-        }
-    } else {
-        snprintf(addr, sizeof addr, "gs:%"PRId64, memop->offset);
-    }
-
-    const char *szpfx = lfi_size_prefix(memop);
-
-    /* Build the replacement instruction */
-    if (ins->operands == 2) {
-        if (mem_op_idx == 0) {
-            /* Memory is destination: op [mem], src */
-            const char *src = nasm_reg_names[ins->oprs[1].basereg - EXPR_REG_START];
-            snprintf(buf, sizeof buf, "%s %s[%s], %s",
-                     opname, szpfx, addr, src);
-        } else {
-            /* Memory is source: op dst, [mem] */
-            const char *dst = nasm_reg_names[ins->oprs[0].basereg - EXPR_REG_START];
-            snprintf(buf, sizeof buf, "%s %s, %s[%s]",
-                     opname, dst, szpfx, addr);
-        }
-    } else {
-        /* Single-operand memory instruction */
-        snprintf(buf, sizeof buf, "%s %s[%s]", opname, szpfx, addr);
-    }
-
+    /*
+     * Struct-copy approach: copy the instruction and modify the memory
+     * operand in-place. This preserves all operand details including
+     * mask register decorators ({k1}), vector index registers (ymm/zmm
+     * in VSIB addressing), and multi-operand instruction forms.
+     *
+     * Changes: convert GPR base/index to 32-bit, add gs: segment.
+     */
     rep->count = 1;
     rep->align_to_end = false;
-    lfi_parse(buf, &rep->instructions[0]);
+    rep->instructions[0] = *ins;
     rep->bundle_locked[0] = false;
+
+    operand *new_memop = &rep->instructions[0].oprs[mem_op_idx];
+
+    /* Convert GPR base register to 32-bit */
+    if (new_memop->basereg != R_none) {
+        enum reg_enum base64 = lfi_to_reg64(new_memop->basereg);
+        enum reg_enum base32 = lfi_to_reg32(base64);
+        if (base32 != R_none)
+            new_memop->basereg = base32;
+    }
+
+    /* Convert GPR index register to 32-bit (skip vector registers) */
+    if (new_memop->indexreg != R_none) {
+        enum reg_enum idx64 = lfi_to_reg64(new_memop->indexreg);
+        enum reg_enum idx32 = lfi_to_reg32(idx64);
+        if (idx32 != R_none)
+            new_memop->indexreg = idx32;
+    }
+
+    /* Add gs: segment override (both eaflags and instruction prefix) */
+    new_memop->eaflags |= EAF_GS;
+    rep->instructions[0].prefixes[PPS_SEG] = R_GS;
+
     return true;
 }
 
@@ -2319,16 +2453,12 @@ static void lfi_sandbox_mem_nosegue(const insn *ins, int mem_op_idx,
 {
     char buf[512];
     const operand *memop = &ins->oprs[mem_op_idx];
-    const char *opname = nasm_insn_names[ins->opcode];
-    const char *szpfx = lfi_size_prefix(memop);
 
     if (memop->indexreg == R_none && memop->basereg != R_none) {
         /* Simple case: base register only */
         const char *base32 = lfi_reg32_name(lfi_to_reg64(memop->basereg));
-        const char *base64 = lfi_reg64_name(memop->basereg);
-        char memstr[LFI_MEMBUFSZ];
 
-        if (!base32 || !base64) {
+        if (!base32) {
             /* Unknown register - pass through */
             rep->count = 1;
             rep->align_to_end = false;
@@ -2345,28 +2475,38 @@ static void lfi_sandbox_mem_nosegue(const insn *ins, int mem_op_idx,
         lfi_parse(buf, &rep->instructions[0]);
         rep->bundle_locked[0] = true;
 
-        /* op ... [r14 + rX + offset] */
-        if (memop->offset != 0)
-            snprintf(memstr, sizeof memstr, "[r14 + %s + %"PRId64"]",
-                     base64, memop->offset);
-        else
-            snprintf(memstr, sizeof memstr, "[r14 + %s]", base64);
-
-        if (ins->operands == 2) {
-            if (mem_op_idx == 0) {
-                const char *src = nasm_reg_names[ins->oprs[1].basereg - EXPR_REG_START];
-                snprintf(buf, sizeof buf, "%s %s%s, %s",
-                         opname, szpfx, memstr, src);
-            } else {
-                const char *dst = nasm_reg_names[ins->oprs[0].basereg - EXPR_REG_START];
-                snprintf(buf, sizeof buf, "%s %s, %s%s",
-                         opname, dst, szpfx, memstr);
-            }
-        } else {
-            snprintf(buf, sizeof buf, "%s %s%s", opname, szpfx, memstr);
-        }
-        lfi_parse(buf, &rep->instructions[1]);
+        /* Struct copy, change addressing to [r14 + base64 + offset] */
+        rep->instructions[1] = *ins;
+        operand *op = &rep->instructions[1].oprs[mem_op_idx];
+        op->indexreg = lfi_to_reg64(op->basereg);
+        op->scale = 1;
+        op->basereg = R_R14;
         rep->bundle_locked[1] = true;
+    } else if (lfi_to_reg64(memop->indexreg) == R_none &&
+               memop->basereg != R_none) {
+        /*
+         * VSIB case: vector index register (gather/scatter).
+         * Can't use lea since vector registers aren't supported in lea.
+         * Instead: mov r11d, base32; add r11, r14; insn [r11 + vidx...]
+         */
+        const char *base32 = lfi_reg32_name(lfi_to_reg64(memop->basereg));
+
+        rep->count = 3;
+        rep->align_to_end = false;
+
+        /* mov r11d, base32 (mask to 32 bits) */
+        snprintf(buf, sizeof buf, "mov r11d, %s", base32);
+        lfi_parse(buf, &rep->instructions[0]);
+        rep->bundle_locked[0] = true;
+
+        /* add r11, r14 (add sandbox base) */
+        lfi_parse("add r11, r14", &rep->instructions[1]);
+        rep->bundle_locked[1] = true;
+
+        /* Struct copy, change base to r11 */
+        rep->instructions[2] = *ins;
+        rep->instructions[2].oprs[mem_op_idx].basereg = R_R11;
+        rep->bundle_locked[2] = true;
     } else {
         /* Complex case: use lea r11d to compute address */
         char origmem[LFI_MEMBUFSZ];
@@ -2381,21 +2521,13 @@ static void lfi_sandbox_mem_nosegue(const insn *ins, int mem_op_idx,
         lfi_parse(buf, &rep->instructions[0]);
         rep->bundle_locked[0] = true;
 
-        /* op ... [r14 + r11] */
-        if (ins->operands == 2) {
-            if (mem_op_idx == 0) {
-                const char *src = nasm_reg_names[ins->oprs[1].basereg - EXPR_REG_START];
-                snprintf(buf, sizeof buf, "%s %s[r14 + r11], %s",
-                         opname, szpfx, src);
-            } else {
-                const char *dst = nasm_reg_names[ins->oprs[0].basereg - EXPR_REG_START];
-                snprintf(buf, sizeof buf, "%s %s, %s[r14 + r11]",
-                         opname, dst, szpfx);
-            }
-        } else {
-            snprintf(buf, sizeof buf, "%s %s[r14 + r11]", opname, szpfx);
-        }
-        lfi_parse(buf, &rep->instructions[1]);
+        /* Struct copy, change addressing to [r14 + r11] */
+        rep->instructions[1] = *ins;
+        operand *op = &rep->instructions[1].oprs[mem_op_idx];
+        op->basereg = R_R14;
+        op->indexreg = R_R11;
+        op->scale = 1;
+        op->offset = 0;
         rep->bundle_locked[1] = true;
     }
 }
@@ -2806,6 +2938,55 @@ static void lfi_expand_virtual_regs(const insn *ins,
                         isOpOfType(ins->oprs[1], REGISTER) &&
                         lfi_is_reserved_reg(ins->oprs[1].basereg));
 
+        if (op0_res && op1_res) {
+            /* Both operands are reserved registers.
+             * Use a temp GPR via push/pop to perform the swap through
+             * the virtual register file without touching physical
+             * reserved registers.
+             *
+             * Sequence:
+             *   push temp
+             *   mov  temp, [r15 + off0]   ; load virtual reg0
+             *   mov  r11,  [r15 + off1]   ; load virtual reg1
+             *   mov  [r15 + off0], r11    ; store reg1 -> slot0
+             *   mov  [r15 + off1], temp   ; store reg0 -> slot1
+             *   pop  temp
+             */
+            int off0 = lfi_vreg_offset(ins->oprs[0].basereg);
+            int off1 = lfi_vreg_offset(ins->oprs[1].basereg);
+
+            enum reg_enum temp = lfi_find_temp_gpr(ins);
+            const char *tname = nasm_reg_names[temp - EXPR_REG_START];
+
+            snprintf(buf, sizeof buf, "push %s", tname);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            snprintf(buf, sizeof buf, "mov %s, [r15 + %d]", tname, off0);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", off1);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            snprintf(buf, sizeof buf, "mov [r15 + %d], r11", off0);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            snprintf(buf, sizeof buf, "mov [r15 + %d], %s", off1, tname);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            snprintf(buf, sizeof buf, "pop %s", tname);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            rep->count = n;
+            rep->align_to_end = false;
+            return;
+        }
+
         if (op0_res || op1_res) {
             enum reg_enum res_reg = op0_res ? ins->oprs[0].basereg
                                             : ins->oprs[1].basereg;
@@ -2870,6 +3051,78 @@ static void lfi_expand_virtual_regs(const insn *ins,
         return;
     }
 
+    /*
+     * 3+ operand instructions with reserved register in operand 2
+     * (BMI2/VEX: shlx, shrx, sarx, rorx, etc.).
+     *
+     * The existing dest/src checks only look at operands 0 and 1.
+     * If operand 2 is a reserved register, it needs substitution too.
+     *
+     * Strategy: load op2 into r11, use r11 for both op2 and dest
+     * (3-operand BMI2 instructions have a write-only destination).
+     * If src (op1) is also reserved, use a memory operand for src.
+     */
+    if (ins->operands >= 3 &&
+        isOpOfType(ins->oprs[2], REGISTER) &&
+        lfi_is_reserved_reg(ins->oprs[2].basereg)) {
+
+        if (has_mem_operand && mem_has_reserved)
+            nasm_fatal("LFI: unsupported 3-operand instruction with "
+                       "reserved registers in both operand 2 and "
+                       "memory addressing mode");
+
+        enum reg_enum op2_val = ins->oprs[2].basereg;
+        int op2_off = lfi_vreg_offset(op2_val);
+
+        /* Load op2 into r11 */
+        snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", op2_off);
+        lfi_parse(buf, &rep->instructions[n]);
+        rep->bundle_locked[n++] = false;
+
+        if (!src_is_reserved || has_mem_operand) {
+            /* Struct copy: replace op2 (and dest if reserved) with r11 */
+            rep->instructions[n] = *ins;
+            rep->instructions[n].oprs[2].basereg = lfi_to_r11(op2_val);
+            if (dest_is_reserved)
+                rep->instructions[n].oprs[0].basereg =
+                    lfi_to_r11(dest_reg);
+            rep->bundle_locked[n++] = false;
+        } else {
+            /* Src (op1) also reserved, no memory operand:
+             * use memory operand for src, r11 for op2 */
+            const char *opname = nasm_insn_names[ins->opcode];
+            const char *dest_name;
+            if (dest_is_reserved)
+                dest_name = lfi_r11_name(lfi_reg_size(dest_reg));
+            else
+                dest_name = nasm_reg_names[
+                    ins->oprs[0].basereg - EXPR_REG_START];
+            const char *src_mem_sz = lfi_vreg_size_str(
+                lfi_reg_size(src_reg));
+            int src_off = lfi_vreg_offset(src_reg);
+            const char *r11_op2 = lfi_r11_name(
+                lfi_reg_size(op2_val));
+
+            snprintf(buf, sizeof buf, "%s %s, %s [r15 + %d], %s",
+                     opname, dest_name, src_mem_sz, src_off,
+                     r11_op2);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+        }
+
+        if (dest_is_reserved) {
+            int dest_off = lfi_vreg_offset(dest_reg);
+            snprintf(buf, sizeof buf, "mov [r15 + %d], r11",
+                     dest_off);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+        }
+
+        rep->count = n;
+        rep->align_to_end = false;
+        return;
+    }
+
     /* Case 5: reserved register in addressing mode (memory operand) */
     if (mem_has_reserved && !dest_is_reserved && !src_is_reserved) {
         const operand *memop = &ins->oprs[mem_op_idx];
@@ -2879,7 +3132,74 @@ static void lfi_expand_virtual_regs(const insn *ins,
                         lfi_is_reserved_reg(memop->indexreg));
 
         if (base_res && idx_res) {
-            nasm_fatal("LFI: too many reserved registers in addressing mode");
+            /*
+             * Both base and index are reserved. We need two scratch
+             * registers.  Use r11 plus a temporary GPR saved/restored
+             * via push/pop (safe in LFI, no rewriting needed).
+             *
+             * Sequence:
+             *   push temp
+             *   mov  temp, [r15 + idx_off]   ; load virtual index
+             *   mov  r11,  [r15 + base_off]  ; load virtual base
+             *   lea  r11,  [r11 + temp*scale + disp]
+             *   <instruction with [r11]>
+             *   pop  temp
+             */
+            int base_off = lfi_vreg_offset(memop->basereg);
+            int idx_off  = lfi_vreg_offset(memop->indexreg);
+            int scale    = memop->scale;
+            int64_t disp = memop->offset;
+
+            enum reg_enum temp = lfi_find_temp_gpr(ins);
+            const char *tname = nasm_reg_names[temp - EXPR_REG_START];
+
+            /* push temp */
+            snprintf(buf, sizeof buf, "push %s", tname);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            /* mov temp, [r15 + idx_off] */
+            snprintf(buf, sizeof buf, "mov %s, [r15 + %d]", tname, idx_off);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            /* mov r11, [r15 + base_off] */
+            snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", base_off);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            /* lea r11, [r11 + temp*scale + disp] */
+            if (scale > 0 && disp != 0)
+                snprintf(buf, sizeof buf, "lea r11, [r11 + %s*%d + %"PRId64"]",
+                         tname, scale, disp);
+            else if (scale > 0)
+                snprintf(buf, sizeof buf, "lea r11, [r11 + %s*%d]",
+                         tname, scale);
+            else if (disp != 0)
+                snprintf(buf, sizeof buf, "lea r11, [r11 + %"PRId64"]", disp);
+            else
+                snprintf(buf, sizeof buf, "lea r11, [r11]");
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            /* Copy instruction, memory operand becomes [r11] */
+            rep->instructions[n] = *ins;
+            rep->instructions[n].oprs[mem_op_idx].basereg = R_R11;
+            rep->instructions[n].oprs[mem_op_idx].indexreg = R_none;
+            rep->instructions[n].oprs[mem_op_idx].scale = 0;
+            rep->instructions[n].oprs[mem_op_idx].offset = 0;
+            rep->instructions[n].oprs[mem_op_idx].segment = NO_SEG;
+            rep->instructions[n].oprs[mem_op_idx].wrt = NO_SEG;
+            rep->bundle_locked[n++] = false;
+
+            /* pop temp */
+            snprintf(buf, sizeof buf, "pop %s", tname);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            rep->count = n;
+            rep->align_to_end = false;
+            return;
         }
 
         enum reg_enum res = base_res ? memop->basereg : memop->indexreg;
@@ -2890,36 +3210,12 @@ static void lfi_expand_virtual_regs(const insn *ins,
         lfi_parse(buf, &rep->instructions[n]);
         rep->bundle_locked[n++] = false;
 
-        /* Rebuild the instruction with r11 replacing the reserved reg */
-        const char *opname = nasm_insn_names[ins->opcode];
-        const char *szpfx = "";
-        char memstr[LFI_MEMBUFSZ];
-        enum reg_enum new_base = base_res ? R_R11 : memop->basereg;
-        enum reg_enum new_idx = idx_res ? R_R11 : memop->indexreg;
-
-        lfi_mem_string(memstr, sizeof memstr, new_base, new_idx,
-                       memop->scale, memop->offset);
-
-        if (mem_op_idx == 0 && ins->operands >= 2) {
-            /* Memory is destination: op [mem], src */
-            szpfx = lfi_size_prefix(memop);
-            const char *src_name = nasm_reg_names[
-                ins->oprs[1].basereg - EXPR_REG_START];
-            snprintf(buf, sizeof buf, "%s %s%s, %s",
-                     opname, szpfx, memstr, src_name);
-        } else if (mem_op_idx == 1 && ins->operands >= 2) {
-            /* Memory is source: op dst, [mem] */
-            szpfx = lfi_size_prefix(memop);
-            const char *dst_name = nasm_reg_names[
-                ins->oprs[0].basereg - EXPR_REG_START];
-            snprintf(buf, sizeof buf, "%s %s, %s%s",
-                     opname, dst_name, szpfx, memstr);
-        } else {
-            /* Single operand with memory */
-            szpfx = lfi_size_prefix(memop);
-            snprintf(buf, sizeof buf, "%s %s%s", opname, szpfx, memstr);
-        }
-        lfi_parse(buf, &rep->instructions[n]);
+        /* Copy instruction, replace reserved reg in addressing with r11 */
+        rep->instructions[n] = *ins;
+        if (base_res)
+            rep->instructions[n].oprs[mem_op_idx].basereg = R_R11;
+        else
+            rep->instructions[n].oprs[mem_op_idx].indexreg = R_R11;
         rep->bundle_locked[n++] = false;
 
         rep->count = n;
@@ -2937,36 +3233,130 @@ static void lfi_expand_virtual_regs(const insn *ins,
         }
 
         enum reg_enum res = dest_is_reserved ? dest_reg : src_reg;
+        int res_op_idx = dest_is_reserved ? 0 : 1;
         int off = lfi_vreg_offset(res);
-        const char *opname = nasm_insn_names[ins->opcode];
-        const char *szpfx = lfi_size_prefix(&ins->oprs[mem_op_idx]);
-        char memstr[LFI_MEMBUFSZ];
-        lfi_mem_string(memstr, sizeof memstr,
-                       ins->oprs[mem_op_idx].basereg,
-                       ins->oprs[mem_op_idx].indexreg,
-                       ins->oprs[mem_op_idx].scale,
-                       ins->oprs[mem_op_idx].offset);
 
-        if (dest_is_reserved) {
-            /* Case 4 dest: add r14, [mem] -> mov r11, [r15+off]; add r11, [mem]; mov [r15+off], r11 */
+        /*
+         * Check if the memory operand's addressing mode also has a
+         * reserved register that is DIFFERENT from the register operand.
+         * If so, we need a temp GPR via push/pop for the addressing mode
+         * while r11 handles the register operand.
+         */
+        const operand *memop = &ins->oprs[mem_op_idx];
+        bool mem_base_res = (memop->basereg != R_none &&
+                             lfi_is_reserved_reg(memop->basereg) &&
+                             lfi_to_reg64(memop->basereg) != lfi_to_reg64(res));
+        bool mem_idx_res  = (memop->indexreg != R_none &&
+                             lfi_is_reserved_reg(memop->indexreg) &&
+                             lfi_to_reg64(memop->indexreg) != lfi_to_reg64(res));
+
+        if (mem_base_res || mem_idx_res) {
+            /*
+             * Different reserved register in addressing mode.
+             * Use push/pop with a temp GPR for the addressing register,
+             * and r11 for the register operand.
+             *
+             * Sequence:
+             *   push temp
+             *   mov  temp, [r15 + mem_vreg_off]  ; load addr virtual reg
+             *   mov  r11,  [r15 + off]           ; load operand virtual reg
+             *   <instruction with temp in addr, r11 as operand>
+             *   mov  [r15 + off], r11            ; store if dest
+             *   pop  temp
+             */
+            enum reg_enum mem_res = mem_base_res ? memop->basereg
+                                                 : memop->indexreg;
+            int mem_off = lfi_vreg_offset(mem_res);
+
+            enum reg_enum temp = lfi_find_temp_gpr(ins);
+            const char *tname = nasm_reg_names[temp - EXPR_REG_START];
+
+            /* push temp */
+            snprintf(buf, sizeof buf, "push %s", tname);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            /* mov temp, [r15 + mem_off] */
+            snprintf(buf, sizeof buf, "mov %s, [r15 + %d]", tname, mem_off);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            /* mov r11, [r15 + off] -- load register operand */
             snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", off);
             lfi_parse(buf, &rep->instructions[n]);
             rep->bundle_locked[n++] = false;
 
-            snprintf(buf, sizeof buf, "%s r11, %s%s", opname, szpfx, memstr);
+            /* Copy instruction, substitute all reserved registers */
+            rep->instructions[n] = *ins;
+            rep->instructions[n].oprs[res_op_idx].basereg = lfi_to_r11(res);
+            {
+                operand *mop = &rep->instructions[n].oprs[mem_op_idx];
+                if (mem_base_res)
+                    mop->basereg = temp;
+                if (mem_idx_res)
+                    mop->indexreg = temp;
+                /* Also substitute same-register references */
+                if (mop->basereg != R_none &&
+                    lfi_to_reg64(mop->basereg) == lfi_to_reg64(res))
+                    mop->basereg = R_R11;
+                if (mop->indexreg != R_none &&
+                    lfi_to_reg64(mop->indexreg) == lfi_to_reg64(res))
+                    mop->indexreg = R_R11;
+            }
+            rep->bundle_locked[n++] = false;
+
+            if (dest_is_reserved ||
+                (ins->opcode == I_XADD && src_is_reserved)) {
+                /* Store r11 back to vreg file.
+                 * xadd modifies both operands (src receives old dest),
+                 * so store back even when the reserved register is src. */
+                snprintf(buf, sizeof buf, "mov [r15 + %d], r11", off);
+                lfi_parse(buf, &rep->instructions[n]);
+                rep->bundle_locked[n++] = false;
+            }
+
+            /* pop temp */
+            snprintf(buf, sizeof buf, "pop %s", tname);
             lfi_parse(buf, &rep->instructions[n]);
             rep->bundle_locked[n++] = false;
 
+            rep->count = n;
+            rep->align_to_end = false;
+            return;
+        }
+
+        /* Load the reserved register into r11 */
+        snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", off);
+        lfi_parse(buf, &rep->instructions[n]);
+        rep->bundle_locked[n++] = false;
+
+        /* Copy instruction, replace reserved register with r11 variant */
+        rep->instructions[n] = *ins;
+        rep->instructions[n].oprs[res_op_idx].basereg = lfi_to_r11(res);
+
+        /*
+         * Also replace the same reserved register in the memory operand's
+         * addressing mode if present (e.g., lea r14, [r14+rsi*2]).
+         * r11 already holds the loaded value, so we can reuse it.
+         */
+        {
+            operand *mop = &rep->instructions[n].oprs[mem_op_idx];
+            if (mop->basereg != R_none &&
+                lfi_to_reg64(mop->basereg) == lfi_to_reg64(res))
+                mop->basereg = R_R11;
+            if (mop->indexreg != R_none &&
+                lfi_to_reg64(mop->indexreg) == lfi_to_reg64(res))
+                mop->indexreg = R_R11;
+        }
+
+        rep->bundle_locked[n++] = false;
+
+        if (dest_is_reserved ||
+            (ins->opcode == I_XADD && src_is_reserved)) {
+            /* Store r11 back to vreg file.
+             * xadd modifies both operands (src receives old dest),
+             * so store back even when the reserved register is src. */
             snprintf(buf, sizeof buf, "mov [r15 + %d], r11", off);
-            lfi_parse(buf, &rep->instructions[n]);
-            rep->bundle_locked[n++] = false;
-        } else {
-            /* Case 4 src: add [mem], r14 -> mov r11, [r15+off]; add [mem], r11 */
-            snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", off);
-            lfi_parse(buf, &rep->instructions[n]);
-            rep->bundle_locked[n++] = false;
-
-            snprintf(buf, sizeof buf, "%s %s%s, r11", opname, szpfx, memstr);
             lfi_parse(buf, &rep->instructions[n]);
             rep->bundle_locked[n++] = false;
         }
@@ -2989,36 +3379,39 @@ static void lfi_expand_virtual_regs(const insn *ins,
 
         if (dest_sz == 32) {
             /* Case 8: 32-bit writes zero-extend r11, store full 64 bits */
-            if (!write_only && !src_is_reserved) {
+            if (!write_only) {
                 /* Read-modify-write: load first */
                 snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", off);
                 lfi_parse(buf, &rep->instructions[n]);
                 rep->bundle_locked[n++] = false;
             }
 
-            /* Build the instruction with r11d replacing the dest */
-            if (ins->operands >= 2) {
-                const char *src_str;
-                char src_buf[64];
-                if (src_is_reserved) {
-                    snprintf(src_buf, sizeof src_buf, "qword [r15 + %d]",
-                             lfi_vreg_offset(src_reg));
-                    src_str = src_buf;
-                } else if (isOpOfType(ins->oprs[1], REGISTER)) {
-                    src_str = nasm_reg_names[
-                        ins->oprs[1].basereg - EXPR_REG_START];
+            if (src_is_reserved) {
+                /* Source is reserved: pre-load source value into r11,
+                 * then use text reconstruction with memory operand.
+                 * (Can't struct-copy because r11 serves as dest proxy
+                 * and we need the source from the vreg file.) */
+                int src_off = lfi_vreg_offset(src_reg);
+                const char *src_mem_sz = lfi_vreg_size_str(
+                    lfi_reg_size(src_reg));
+                if (ins->operands >= 3) {
+                    int64_t imm = ins->oprs[2].offset;
+                    snprintf(buf, sizeof buf,
+                             "%s r11d, %s [r15 + %d], %"PRId64,
+                             opname, src_mem_sz, src_off, imm);
                 } else {
-                    /* Immediate */
-                    snprintf(src_buf, sizeof src_buf, "%"PRId64,
-                             ins->oprs[1].offset);
-                    src_str = src_buf;
+                    snprintf(buf, sizeof buf, "%s r11d, %s [r15 + %d]",
+                             opname, src_mem_sz, src_off);
                 }
-                snprintf(buf, sizeof buf, "%s r11d, %s", opname, src_str);
+                lfi_parse(buf, &rep->instructions[n]);
+                rep->bundle_locked[n++] = false;
             } else {
-                snprintf(buf, sizeof buf, "%s r11d", opname);
+                /* Struct copy: preserves all operands (handles 3+
+                 * operand instructions like rorx, shrx, etc.) */
+                rep->instructions[n] = *ins;
+                rep->instructions[n].oprs[0].basereg = R_R11D;
+                rep->bundle_locked[n++] = false;
             }
-            lfi_parse(buf, &rep->instructions[n]);
-            rep->bundle_locked[n++] = false;
 
             /* Store full 64-bit r11 */
             snprintf(buf, sizeof buf, "mov [r15 + %d], r11", off);
@@ -3040,30 +3433,27 @@ static void lfi_expand_virtual_regs(const insn *ins,
                 lfi_parse(buf, &rep->instructions[n]);
                 rep->bundle_locked[n++] = false;
 
-                /* Use r11b/r11w as the destination */
-                const char *r11_sub = (dest_sz == 8) ? "r11b" : "r11w";
-                if (ins->operands >= 2) {
-                    const char *src_str;
-                    char src_buf[64];
-                    if (src_is_reserved) {
-                        snprintf(src_buf, sizeof src_buf, "%s [r15 + %d]",
-                                 sz_str, lfi_vreg_offset(src_reg));
-                        src_str = src_buf;
-                    } else if (isOpOfType(ins->oprs[1], REGISTER)) {
-                        src_str = nasm_reg_names[
-                            ins->oprs[1].basereg - EXPR_REG_START];
+                if (src_is_reserved) {
+                    const char *r11_sz = (dest_sz == 8) ? "r11b" : "r11w";
+                    if (ins->operands >= 3) {
+                        int64_t imm = ins->oprs[2].offset;
+                        snprintf(buf, sizeof buf,
+                                 "%s %s, %s [r15 + %d], %"PRId64,
+                                 opname, r11_sz, sz_str,
+                                 lfi_vreg_offset(src_reg), imm);
                     } else {
-                        snprintf(src_buf, sizeof src_buf, "%"PRId64,
-                                 ins->oprs[1].offset);
-                        src_str = src_buf;
+                        snprintf(buf, sizeof buf, "%s %s, %s [r15 + %d]",
+                                 opname, r11_sz, sz_str,
+                                 lfi_vreg_offset(src_reg));
                     }
-                    snprintf(buf, sizeof buf, "%s %s, %s",
-                             opname, r11_sub, src_str);
+                    lfi_parse(buf, &rep->instructions[n]);
+                    rep->bundle_locked[n++] = false;
                 } else {
-                    snprintf(buf, sizeof buf, "%s %s", opname, r11_sub);
+                    /* Struct copy: preserves all operands */
+                    rep->instructions[n] = *ins;
+                    rep->instructions[n].oprs[0].basereg = lfi_to_r11(dest_reg);
+                    rep->bundle_locked[n++] = false;
                 }
-                lfi_parse(buf, &rep->instructions[n]);
-                rep->bundle_locked[n++] = false;
 
                 snprintf(buf, sizeof buf, "mov [r15 + %d], r11", off);
                 lfi_parse(buf, &rep->instructions[n]);
@@ -3106,17 +3496,31 @@ static void lfi_expand_virtual_regs(const insn *ins,
         const char *opname = nasm_insn_names[ins->opcode];
         bool write_only = (ins->opcode == I_MOV || ins->opcode == I_LEA);
 
+        /* call/jmp: operand 0 is the branch target (read-only).
+         * No store-back -- the register is not modified by the branch,
+         * and r11 is clobbered by the indirect branch rewrite sequence
+         * (and by the callee for call). */
+        if (ins->opcode == I_CALL || ins->opcode == I_JMP) {
+            snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", off);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+
+            rep->instructions[n] = *ins;
+            rep->instructions[n].oprs[0].basereg = R_R11;
+            rep->bundle_locked[n++] = false;
+
+            rep->count = n;
+            rep->align_to_end = false;
+            return;
+        }
+
         if (write_only) {
             /* Case 2: Write-only destination */
             if (ins->opcode == I_LEA) {
-                /* lea r14, [rax] -> lea r11, [rax]; mov [r15 + off], r11 */
-                char memstr[LFI_MEMBUFSZ];
-                const operand *src_op = &ins->oprs[1];
-                lfi_mem_string(memstr, sizeof memstr, src_op->basereg,
-                               src_op->indexreg, src_op->scale,
-                               src_op->offset);
-                snprintf(buf, sizeof buf, "lea r11, %s", memstr);
-                lfi_parse(buf, &rep->instructions[n]);
+                /* lea r14, [expr] -> lea r11, [expr]; mov [r15+off], r11
+                 * Use struct copy to preserve symbolic operands. */
+                rep->instructions[n] = *ins;
+                rep->instructions[n].oprs[0].basereg = R_R11;
                 rep->bundle_locked[n++] = false;
 
                 snprintf(buf, sizeof buf, "mov [r15 + %d], r11", off);
@@ -3146,8 +3550,26 @@ static void lfi_expand_virtual_regs(const insn *ins,
                         src_str = nasm_reg_names[
                             ins->oprs[1].basereg - EXPR_REG_START];
                     } else {
-                        snprintf(src_buf, sizeof src_buf, "%"PRId64,
-                                 ins->oprs[1].offset);
+                        /* Immediate value */
+                        int64_t imm = ins->oprs[1].offset;
+                        if (imm > INT32_MAX || imm < INT32_MIN) {
+                            /* 64-bit immediate: must go through r11
+                             * (mov m64, imm32 only sign-extends) */
+                            snprintf(buf, sizeof buf,
+                                     "mov r11, %"PRId64, imm);
+                            lfi_parse(buf, &rep->instructions[n]);
+                            rep->bundle_locked[n++] = false;
+
+                            snprintf(buf, sizeof buf,
+                                     "mov [r15 + %d], r11", off);
+                            lfi_parse(buf, &rep->instructions[n]);
+                            rep->bundle_locked[n++] = false;
+
+                            rep->count = n;
+                            rep->align_to_end = false;
+                            return;
+                        }
+                        snprintf(src_buf, sizeof src_buf, "%"PRId64, imm);
                         src_str = src_buf;
                     }
                     snprintf(buf, sizeof buf, "mov qword [r15 + %d], %s",
@@ -3163,29 +3585,31 @@ static void lfi_expand_virtual_regs(const insn *ins,
             lfi_parse(buf, &rep->instructions[n]);
             rep->bundle_locked[n++] = false;
 
-            /* Build instruction with r11 as dest */
-            if (ins->operands >= 2) {
-                const char *src_str;
-                char src_buf[64];
-                if (src_is_reserved) {
-                    /* Case 6: Two reserved regs - source as memory */
-                    snprintf(src_buf, sizeof src_buf, "qword [r15 + %d]",
-                             lfi_vreg_offset(src_reg));
-                    src_str = src_buf;
-                } else if (isOpOfType(ins->oprs[1], REGISTER)) {
-                    src_str = nasm_reg_names[
-                        ins->oprs[1].basereg - EXPR_REG_START];
+            if (src_is_reserved) {
+                /* Case 6: Two reserved regs - source as memory */
+                const char *src_mem_sz = lfi_vreg_size_str(
+                    lfi_reg_size(src_reg));
+                if (ins->operands >= 3) {
+                    /* 3-operand (e.g., imul r14, r11, 5): include
+                     * the immediate third operand. */
+                    int64_t imm = ins->oprs[2].offset;
+                    snprintf(buf, sizeof buf,
+                             "%s r11, %s [r15 + %d], %"PRId64,
+                             opname, src_mem_sz,
+                             lfi_vreg_offset(src_reg), imm);
                 } else {
-                    snprintf(src_buf, sizeof src_buf, "%"PRId64,
-                             ins->oprs[1].offset);
-                    src_str = src_buf;
+                    snprintf(buf, sizeof buf, "%s r11, %s [r15 + %d]",
+                             opname, src_mem_sz,
+                             lfi_vreg_offset(src_reg));
                 }
-                snprintf(buf, sizeof buf, "%s r11, %s", opname, src_str);
+                lfi_parse(buf, &rep->instructions[n]);
+                rep->bundle_locked[n++] = false;
             } else {
-                snprintf(buf, sizeof buf, "%s r11", opname);
+                /* Struct copy: preserves all operands */
+                rep->instructions[n] = *ins;
+                rep->instructions[n].oprs[0].basereg = R_R11;
+                rep->bundle_locked[n++] = false;
             }
-            lfi_parse(buf, &rep->instructions[n]);
-            rep->bundle_locked[n++] = false;
 
             /* Store r11 back */
             snprintf(buf, sizeof buf, "mov [r15 + %d], r11", off);
@@ -3201,41 +3625,29 @@ static void lfi_expand_virtual_regs(const insn *ins,
     /* Case 1: Source-only substitution (dest is not reserved) */
     if (src_is_reserved && !dest_is_reserved && !has_mem_operand) {
         int off = lfi_vreg_offset(src_reg);
-        int src_sz = lfi_reg_size(src_reg);
-        const char *opname = nasm_insn_names[ins->opcode];
-        const char *sz_str;
 
-        switch (src_sz) {
-        case 8:  sz_str = "byte"; break;
-        case 16: sz_str = "word"; break;
-        case 32: sz_str = "dword"; break;
-        default: sz_str = "qword"; break;
-        }
-
-        /* Replace source register with memory operand [r15 + off] */
-        if (ins->operands >= 2) {
-            const char *dst_str;
-            char dst_buf[64];
-            if (isOpOfType(ins->oprs[0], REGISTER)) {
-                dst_str = nasm_reg_names[
-                    ins->oprs[0].basereg - EXPR_REG_START];
-            } else {
-                snprintf(dst_buf, sizeof dst_buf, "%"PRId64,
-                         ins->oprs[0].offset);
-                dst_str = dst_buf;
-            }
-            snprintf(buf, sizeof buf, "%s %s, %s [r15 + %d]",
-                     opname, dst_str, sz_str, off);
-        } else {
-            /* Single-operand instruction with reserved source */
-            snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", off);
-            lfi_parse(buf, &rep->instructions[n]);
-            rep->bundle_locked[n++] = false;
-
-            snprintf(buf, sizeof buf, "%s r11", opname);
-        }
+        /* Pre-load source virtual register into r11 */
+        snprintf(buf, sizeof buf, "mov r11, [r15 + %d]", off);
         lfi_parse(buf, &rep->instructions[n]);
         rep->bundle_locked[n++] = false;
+
+        /* Struct copy instruction, replace source with r11 variant.
+         * This preserves all operands (handles 3+ operand instructions
+         * like rorx, shrx, etc.) */
+        rep->instructions[n] = *ins;
+        if (ins->operands >= 2)
+            rep->instructions[n].oprs[1].basereg = lfi_to_r11(src_reg);
+        else
+            rep->instructions[n].oprs[0].basereg = R_R11;
+        rep->bundle_locked[n++] = false;
+
+        /* xadd modifies both operands: src (operand 1) receives old dest.
+         * After the struct copy, r11 holds the updated source value. */
+        if (ins->opcode == I_XADD) {
+            snprintf(buf, sizeof buf, "mov [r15 + %d], r11", off);
+            lfi_parse(buf, &rep->instructions[n]);
+            rep->bundle_locked[n++] = false;
+        }
 
         rep->count = n;
         rep->align_to_end = false;
@@ -3318,13 +3730,93 @@ static int64_t lfi_group_size(struct lfi_replacement *rep,
  * The multi-pass assembler will converge because the same replacement
  * logic runs identically each pass (padding depends only on offset).
  */
+/*
+ * Emit a flag-preserving return (lfi_ret pseudo-instruction).
+ * Uses the lfi_expand_return_with_flags() replacement and emits
+ * each instruction through the bundling/padding logic.
+ */
+static void lfi_emit_return_with_flags(void)
+{
+    struct lfi_replacement rep;
+    lfi_expand_return_with_flags(&rep);
+
+    int i = 0;
+    while (i < rep.count) {
+        insn *ri = &rep.instructions[i];
+        ri->times = 1;
+
+        if (!rep.bundle_locked[i]) {
+            process_insn(ri);
+            i++;
+            continue;
+        }
+
+        int group_start = i;
+        int group_end = i;
+        while (group_end < rep.count && rep.bundle_locked[group_end])
+            group_end++;
+
+        int64_t group_sz = lfi_group_size(&rep, group_start, group_end);
+
+        int64_t cur_offset = location.offset;
+        int64_t bundle_end =
+            (cur_offset + LFI_BUNDLE_SIZE - 1)
+            & ~(LFI_BUNDLE_SIZE - 1);
+        int64_t space_left = bundle_end - cur_offset;
+
+        if (space_left < group_sz)
+            lfi_emit_nop_padding(space_left);
+
+        for (int j = group_start; j < group_end; j++) {
+            rep.instructions[j].times = 1;
+            process_insn(&rep.instructions[j]);
+        }
+
+        i = group_end;
+    }
+}
+
+/*
+ * Check if a source line is the lfi_ret pseudo-instruction.
+ * Returns true if the line was handled.
+ */
+static bool lfi_check_pseudo_instruction(const char *line)
+{
+    const char *p = line;
+
+    /* Skip leading whitespace */
+    while (*p == ' ' || *p == '\t')
+        p++;
+
+    /* Check for "lfi_ret" */
+    if (strncmp(p, "lfi_ret", 7) != 0)
+        return false;
+
+    /* Must be followed by whitespace, comment, or end of line */
+    char c = p[7];
+    if (c != '\0' && c != ' ' && c != '\t' && c != ';' && c != '\n')
+        return false;
+
+    if (lfi_mode) {
+        lfi_emit_return_with_flags();
+    } else {
+        /* Without LFI, emit a plain ret */
+        insn ret_ins = { 0 };
+        lfi_parse("ret", &ret_ins);
+        ret_ins.times = 1;
+        process_insn(&ret_ins);
+    }
+    return true;
+}
+
 static void lfi_process_instruction(insn *ins)
 {
     struct lfi_replacement rep;
     int32_t times_save = ins->times;
     int32_t t;
 
-    if (ins->opcode == I_none) {
+    if (ins->opcode == I_none ||
+        opcode_is_db(ins->opcode) || opcode_is_resb(ins->opcode)) {
         process_insn(ins);
         return;
     }
@@ -3488,6 +3980,8 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
             location.known = true;
         ofmt->reset();
         switch_segment(ofmt->section(NULL, &globl.bits));
+        if (lfi_mode)
+            lfi_in_text_section = true; /* default section is .text */
         pp_reset(fname, PP_NORMAL, depend_list);
 
         globallineno = 0;
@@ -3502,7 +3996,7 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
              * direct jump targets are always bundle-aligned.
              */
             if (lfi_mode && !lfi_no_align_labels && !in_absolute &&
-                parse_check_is_label(line)) {
+                lfi_in_text_section && parse_check_is_label(line)) {
                 int pad = (LFI_BUNDLE_SIZE -
                            (int)(location.offset % LFI_BUNDLE_SIZE))
                           % LFI_BUNDLE_SIZE;
@@ -3516,6 +4010,10 @@ static void assemble_file(const char *fname, struct strlist *depend_list)
              */
             if (process_directives(line))
                 goto end_of_line; /* Just do final cleanup */
+
+            /* Check for LFI pseudo-instructions (e.g., lfi_ret) */
+            if (lfi_check_pseudo_instruction(line))
+                goto end_of_line;
 
             /* Not a directive, or even something that starts with [ */
             parse_line(line, &output_ins, globl.bits);

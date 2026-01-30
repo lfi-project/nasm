@@ -328,9 +328,17 @@ bool process_directives(char *directive)
         } else {
             globl.bits = sb;
             switch_segment(seg);
-            /* LFI: enforce minimum 32-byte section alignment */
-            if (lfi_mode)
-                ofmt->sectalign(seg, 32);
+            if (lfi_mode) {
+                /* Track whether we're in .text (executable) section */
+                lfi_in_text_section =
+                    !strncmp(value, ".text", 5) &&
+                    (value[5] == '\0' || nasm_isspace(value[5]));
+                /* Enforce minimum 32-byte section alignment
+                 * (skip .note sections which have specific alignment
+                 * requirements in the ELF spec) */
+                if (strncmp(value, ".note", 5) != 0)
+                    ofmt->sectalign(seg, 32);
+            }
         }
         break;
     }
