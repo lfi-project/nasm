@@ -24,6 +24,7 @@ memory accesses are sandboxed:
 | `--no-lfi-stores` | Do not sandbox store instructions |
 | `--no-lfi-segue` | Do not use the `gs` segment for memory sandboxing |
 | `--no-lfi-align-labels` | Do not align labels to bundle boundaries |
+| `--lfi-vregs` | Enable virtual register file for reserved registers |
 
 Use `--no-lfi-loads` for a stores-only sandbox that may read outside the
 sandbox but cannot write outside it.
@@ -194,6 +195,123 @@ TLS accesses via `fs:0` are rewritten to use the virtual register file:
 ; Original:            ; Rewritten:
 mov rax, [fs:0]        mov rax, [r15]
 ```
+
+## Virtual Registers
+
+When `--lfi-vregs` is enabled, user assembly may reference the reserved
+registers `r11`, `r14`, and `r15`. These are transparently rewritten
+into loads and stores from a memory-backed virtual register file at
+offsets from `r15`:
+
+| Offset | Virtual Register |
+|--------|-----------------|
+| `[r15 + 40]` | `r11` |
+| `[r15 + 48]` | `r14` |
+| `[r15 + 56]` | `r15` |
+
+The expansion is a pre-pass: each user instruction referencing a
+reserved register is expanded into 1-3 instructions that use only
+non-reserved registers, then each expanded instruction goes through
+the normal LFI pipeline individually.
+
+### Rewrite Examples
+
+**Source substitution** (reserved register as source, no memory conflict):
+
+```
+; Original:              ; Rewritten:
+mov rax, r14             mov rax, qword [r15 + 48]
+add rax, r14             add rax, qword [r15 + 48]
+```
+
+**Destination substitution** (write-only):
+
+```
+; Original:              ; Rewritten:
+mov r14, rax             mov qword [r15 + 48], rax
+lea r14, [rax]           lea r11, [rax]
+                         mov [r15 + 48], r11
+```
+
+**Read-modify-write destination** (ALU ops):
+
+```
+; Original:              ; Rewritten:
+add r14, rax             mov r11, [r15 + 48]
+                         add r11, rax
+                         mov [r15 + 48], r11
+```
+
+**Memory operand conflict** (instruction already has a memory operand):
+
+```
+; Original:              ; Rewritten:
+add [rdi], r14           mov r11, [r15 + 48]
+                         add [rdi], r11
+
+add r14, [rdi]           mov r11, [r15 + 48]
+                         add r11, [rdi]
+                         mov [r15 + 48], r11
+```
+
+**Reserved register in addressing mode**:
+
+```
+; Original:                ; Rewritten:
+mov rax, [r14 + rbx]      mov r11, [r15 + 48]
+                           mov rax, [r11 + rbx]
+```
+
+**Two reserved registers**:
+
+```
+; Original:              ; Rewritten:
+add r14, r11             mov r11, [r15 + 48]
+                         add r11, qword [r15 + 40]
+                         mov [r15 + 48], r11
+```
+
+**push/pop**:
+
+```
+; Original:              ; Rewritten:
+push r14                 mov r11, [r15 + 48]
+                         push r11
+
+pop r14                  pop r11
+                         mov [r15 + 48], r11
+```
+
+**32-bit writes** (zero-extension):
+
+```
+; Original:              ; Rewritten:
+mov r14d, eax            mov r11d, eax
+                         mov [r15 + 48], r11
+```
+
+**8/16-bit writes** (direct memory substitution, no zero-extension):
+
+```
+; Original:              ; Rewritten:
+mov r14w, ax             mov word [r15 + 48], ax
+mov r14b, al             mov byte [r15 + 48], al
+```
+
+**xchg**:
+
+```
+; Original:              ; Rewritten:
+xchg r14, rax            mov r11, [r15 + 48]
+                         mov [r15 + 48], rax
+                         mov rax, r11
+```
+
+### Flags Preservation
+
+All expansion sequences use `mov` for load/store operations, which does
+not modify the CPU flags register. This ensures that flag state is
+preserved through virtual register load/store sequences.
 
 ## Bundle Alignment
 
